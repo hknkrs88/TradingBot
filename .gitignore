@@ -1,6 +1,9 @@
 # Python
 __pycache__/
 *.py[cod]
+*.egg-info/
+dist/
+build/
 
 # Virtual environment
 .venv/
@@ -15,12 +18,15 @@ __pycache__/
 .cursor/
 
 # Logs
-logs/
+logs/*
+!logs/.gitkeep
 *.log
 
 # Local data
 data/raw/*
+!data/raw/.gitkeep
 data/processed/*
+!data/processed/.gitkeep
 *.db
 *.sqlite
 *.sqlite3

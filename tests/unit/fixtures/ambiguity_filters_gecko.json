@@ -1,0 +1,37 @@
+[
+  {
+    "id": "bitcoin",
+    "symbol": "btc",
+    "name": "Bitcoin",
+    "market_cap_rank": 1,
+    "market_cap": 2000000000000
+  },
+  {
+    "id": "tether",
+    "symbol": "usdt",
+    "name": "Tether",
+    "market_cap_rank": 3,
+    "market_cap": 120000000000
+  },
+  {
+    "id": "pepe",
+    "symbol": "pepe",
+    "name": "Pepe",
+    "market_cap_rank": 20,
+    "market_cap": 5000000000
+  },
+  {
+    "id": "dogecoin",
+    "symbol": "doge",
+    "name": "Dogecoin",
+    "market_cap_rank": 8,
+    "market_cap": 30000000000
+  },
+  {
+    "id": "btc-up",
+    "symbol": "btcup",
+    "name": "BTC UP",
+    "market_cap_rank": 99,
+    "market_cap": 1
+  }
+]

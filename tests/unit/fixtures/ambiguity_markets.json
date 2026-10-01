@@ -1,0 +1,72 @@
+[
+  {
+    "symbol": "BTC/USDT",
+    "base": "BTC",
+    "quote": "USDT",
+    "active": true,
+    "spot": true,
+    "margin": false,
+    "future": false,
+    "swap": false,
+    "option": false,
+    "contract": false,
+    "type": "spot",
+    "status": "TRADING"
+  },
+  {
+    "symbol": "AI/USDT",
+    "base": "AI",
+    "quote": "USDT",
+    "active": true,
+    "spot": true,
+    "margin": false,
+    "future": false,
+    "swap": false,
+    "option": false,
+    "contract": false,
+    "type": "spot",
+    "status": "TRADING"
+  },
+  {
+    "symbol": "PEPE/USDC",
+    "base": "PEPE",
+    "quote": "USDC",
+    "active": true,
+    "spot": true,
+    "margin": false,
+    "future": false,
+    "swap": false,
+    "option": false,
+    "contract": false,
+    "type": "spot",
+    "status": "TRADING"
+  },
+  {
+    "symbol": "BTCUP/USDT",
+    "base": "BTCUP",
+    "quote": "USDT",
+    "active": true,
+    "spot": true,
+    "margin": false,
+    "future": false,
+    "swap": false,
+    "option": false,
+    "contract": false,
+    "type": "spot",
+    "status": "TRADING"
+  },
+  {
+    "symbol": "DOGE/USDT",
+    "base": "DOGE",
+    "quote": "USDT",
+    "active": true,
+    "spot": false,
+    "margin": false,
+    "future": false,
+    "swap": true,
+    "option": false,
+    "contract": true,
+    "type": "swap",
+    "status": "TRADING"
+  }
+]

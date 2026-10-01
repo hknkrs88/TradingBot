@@ -1,0 +1,58 @@
+[
+  {
+    "id": "bitcoin",
+    "symbol": "btc",
+    "name": "Bitcoin",
+    "market_cap_rank": 1,
+    "market_cap": 2000000000000
+  },
+  {
+    "id": "ethereum",
+    "symbol": "eth",
+    "name": "Ethereum",
+    "market_cap_rank": 2,
+    "market_cap": 400000000000
+  },
+  {
+    "id": "tether",
+    "symbol": "usdt",
+    "name": "Tether",
+    "market_cap_rank": 3,
+    "market_cap": 120000000000
+  },
+  {
+    "id": "usd-coin",
+    "symbol": "usdc",
+    "name": "USDC",
+    "market_cap_rank": 4,
+    "market_cap": 40000000000
+  },
+  {
+    "id": "holo",
+    "symbol": "hot",
+    "name": "Holo",
+    "market_cap_rank": 50,
+    "market_cap": 1000000000
+  },
+  {
+    "id": "hydro-protocol",
+    "symbol": "hot",
+    "name": "Hydro Protocol",
+    "market_cap_rank": 80,
+    "market_cap": 100000000
+  },
+  {
+    "id": "pepe",
+    "symbol": "pepe",
+    "name": "Pepe",
+    "market_cap_rank": 20,
+    "market_cap": 5000000000
+  },
+  {
+    "id": "cardano",
+    "symbol": "ada",
+    "name": "Cardano USD name decoy",
+    "market_cap_rank": 10,
+    "market_cap": 20000000000
+  }
+]

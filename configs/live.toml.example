@@ -1,0 +1,7 @@
+# Example only. Live mode is refused by the current skeleton.
+# Copy is not enough: code still blocks mode="live".
+mode = "live"
+exchange_id = "binance"
+sandbox = false
+market_type = "spot"
+symbol = "BTC/USDT"

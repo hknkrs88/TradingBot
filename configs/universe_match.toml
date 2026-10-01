@@ -1,0 +1,41 @@
+# Universe matcher policy. Ambiguous tickers are not guessed from symbol==base.
+# Auto-match only when the CoinGecko ticker is unique, long enough, and not listed
+# in require_override. Everything else needs an explicit override triple.
+
+min_auto_ticker_length = 3
+
+# Always require override, even when the ticker is long enough.
+require_override = [
+    "GRAM",
+    "AWE",
+    "AI",
+    "A",
+    "S",
+    "U",
+]
+
+# Allowed matches. ticker, coingecko_id, and binance_symbol must all agree.
+[[overrides]]
+ticker = "OP"
+coingecko_id = "optimism"
+binance_symbol = "OP/USDT"
+
+[[overrides]]
+ticker = "ZK"
+coingecko_id = "zksync"
+binance_symbol = "ZK/USDT"
+
+[[overrides]]
+ticker = "AR"
+coingecko_id = "arweave"
+binance_symbol = "AR/USDT"
+
+[[overrides]]
+ticker = "FF"
+coingecko_id = "falcon-finance-ff"
+binance_symbol = "FF/USDT"
+
+[[overrides]]
+ticker = "2Z"
+coingecko_id = "doublezero"
+binance_symbol = "2Z/USDT"

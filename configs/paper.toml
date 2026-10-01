@@ -1,0 +1,7 @@
+mode = "paper"
+exchange_id = "binance"
+sandbox = true
+market_type = "spot"
+symbol = "BTC/USDT"
+universe_path = "data/processed/universe.json"
+universe_match_path = "configs/universe_match.toml"

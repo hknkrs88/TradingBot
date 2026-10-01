@@ -1,0 +1,10 @@
+min_auto_ticker_length = 3
+
+require_override = [
+    "AI",
+]
+
+[[overrides]]
+ticker = "AI"
+coingecko_id = "sleepless-ai"
+binance_symbol = "AI/USDT"
