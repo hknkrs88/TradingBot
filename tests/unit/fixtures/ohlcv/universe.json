@@ -1,0 +1,21 @@
+{
+  "generated_at": "2026-10-01T21:29:31+00:00",
+  "universe": [
+    {
+      "binance_symbol": "BTC/USDT",
+      "base": "BTC",
+      "quote": "USDT",
+      "coingecko_id": "bitcoin",
+      "name": "Bitcoin",
+      "market_cap_rank": 1
+    },
+    {
+      "binance_symbol": "ETH/USDT",
+      "base": "ETH",
+      "quote": "USDT",
+      "coingecko_id": "ethereum",
+      "name": "Ethereum",
+      "market_cap_rank": 2
+    }
+  ]
+}

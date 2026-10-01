@@ -19,6 +19,7 @@ class Settings(BaseSettings):
     symbol: str = "BTC/USDT"
     universe_path: str = "data/processed/universe.json"
     universe_match_path: str = "configs/universe_match.toml"
+    ohlcv_config_path: str = "configs/ohlcv.toml"
     binance_api_key: str = ""
     binance_api_secret: str = Field(default="", repr=False)
 

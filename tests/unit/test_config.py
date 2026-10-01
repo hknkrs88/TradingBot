@@ -26,3 +26,4 @@ def test_load_paper_toml() -> None:
     assert settings.symbol == "BTC/USDT"
     assert settings.universe_path == "data/processed/universe.json"
     assert settings.universe_match_path == "configs/universe_match.toml"
+    assert settings.ohlcv_config_path == "configs/ohlcv.toml"
