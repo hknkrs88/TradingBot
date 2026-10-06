@@ -1,0 +1,4 @@
+[strategy]
+name = "ma_crossover"
+fast = 20
+slow = 50
