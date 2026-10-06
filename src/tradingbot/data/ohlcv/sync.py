@@ -13,6 +13,7 @@ from tradingbot.data.ohlcv.binance_ohlcv import (
     MAX_OHLCV_LIMIT,
     BinancePublicOHLCVProvider,
 )
+from tradingbot.data.ohlcv.manifest import write_ohlcv_manifests
 from tradingbot.data.ohlcv.models import Candle
 from tradingbot.data.ohlcv.protocol import OHLCVProvider
 from tradingbot.data.ohlcv.retry import call_with_retry
@@ -353,4 +354,14 @@ def sync_ohlcv(
     report["symbols_ok"] = len(ok_symbols)
     report["symbols_failed"] = len(failed_symbols)
     atomic_write_json(processed_root / "sync_report.json", report)
+    write_ohlcv_manifests(
+        universe_path=universe_path,
+        processed_root=processed_root,
+        timeframes=config.timeframes,
+        provider=config.provider,
+        candle_limit=config.candle_limit,
+        drop_incomplete=config.drop_incomplete,
+        now_ms=now_ms,
+        root=base,
+    )
     return report
