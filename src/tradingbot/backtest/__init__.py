@@ -1,5 +1,6 @@
 """Offline backtest simulation. No broker, no network, no orders."""
 
+from tradingbot.backtest.dataset import BacktestDataset, load_backtest_series
 from tradingbot.backtest.engine import run_backtest
 from tradingbot.backtest.models import (
     BacktestConfig,
@@ -10,8 +11,10 @@ from tradingbot.backtest.models import (
 
 __all__ = [
     "BacktestConfig",
+    "BacktestDataset",
     "BacktestResult",
     "EquityPoint",
     "Trade",
+    "load_backtest_series",
     "run_backtest",
 ]
