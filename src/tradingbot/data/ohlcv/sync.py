@@ -9,7 +9,10 @@ from typing import Any, Callable
 import ccxt
 
 from tradingbot.data.io import InvalidCacheError, atomic_write_json, load_json
-from tradingbot.data.ohlcv.binance_ohlcv import BinancePublicOHLCVProvider
+from tradingbot.data.ohlcv.binance_ohlcv import (
+    MAX_OHLCV_LIMIT,
+    BinancePublicOHLCVProvider,
+)
 from tradingbot.data.ohlcv.models import Candle
 from tradingbot.data.ohlcv.protocol import OHLCVProvider
 from tradingbot.data.ohlcv.retry import call_with_retry
@@ -23,7 +26,11 @@ from tradingbot.data.ohlcv.store import (
     processed_path,
     raw_path,
 )
-from tradingbot.data.ohlcv.timeframes import UnsupportedTimeframeError, validate_timeframes
+from tradingbot.data.ohlcv.timeframes import (
+    UnsupportedTimeframeError,
+    timeframe_ms,
+    validate_timeframes,
+)
 
 log = logging.getLogger("tradingbot.data.ohlcv.sync")
 
@@ -54,7 +61,7 @@ def load_ohlcv_config(path: Path) -> OHLCVConfig:
     data = tomllib.loads(path.read_text(encoding="utf-8"))
     timeframes = validate_timeframes([str(item) for item in data.get("timeframes", [])])
     candle_limit = int(data.get("candle_limit", 1000))
-    if candle_limit < 1 or candle_limit > 1000:
+    if candle_limit < 1 or candle_limit > MAX_OHLCV_LIMIT:
         raise ValueError("candle_limit must be between 1 and 1000")
     provider = str(data.get("provider", "binance_public"))
     if provider != "binance_public":
@@ -84,6 +91,72 @@ def load_universe_symbols(universe_path: Path) -> list[str]:
     if not symbols:
         raise InvalidCacheError(f"universe has no binance_symbol values: {universe_path}")
     return symbols
+
+
+def _page_limit(config: OHLCVConfig) -> int:
+    return min(max(config.candle_limit, 1), MAX_OHLCV_LIMIT)
+
+
+def _unique_keep_first(candles: list[Candle]) -> list[Candle]:
+    seen: set[int] = set()
+    ordered: list[Candle] = []
+    for candle in candles:
+        if candle.timestamp in seen:
+            continue
+        seen.add(candle.timestamp)
+        ordered.append(candle)
+    return ordered
+
+
+def fetch_ohlcv_pages(
+    provider: OHLCVProvider,
+    symbol: str,
+    timeframe: str,
+    *,
+    since: int | None,
+    config: OHLCVConfig,
+    now_ms: int,
+    sleep_fn: Callable[[float], None],
+) -> list[Candle]:
+    tf_ms = timeframe_ms(timeframe)
+    page_limit = _page_limit(config)
+    cursor = since
+    collected: list[Candle] = []
+    last_progress_ts: int | None = None
+
+    while True:
+        def _fetch() -> list[Candle]:
+            return provider.fetch_ohlcv(
+                symbol, timeframe, since=cursor, limit=page_limit
+            )
+
+        page = call_with_retry(
+            _fetch,
+            retry_max=config.retry_max,
+            backoff_seconds=config.backoff_seconds,
+            sleep_fn=sleep_fn,
+            retry_exceptions=RETRYABLE,
+        )
+        if not page:
+            break
+
+        collected.extend(page)
+        closed_ts = [
+            item.timestamp for item in page if item.timestamp + tf_ms <= now_ms
+        ]
+        if not closed_ts:
+            break
+        page_max_closed = max(closed_ts)
+        if last_progress_ts is not None and page_max_closed <= last_progress_ts:
+            break
+        last_progress_ts = page_max_closed
+        if len(page) < page_limit:
+            break
+        if is_caught_up(page_max_closed, timeframe, now_ms):
+            break
+        cursor = page_max_closed + tf_ms
+
+    return collected
 
 
 def _empty_report() -> dict[str, Any]:
@@ -143,24 +216,22 @@ def sync_symbol_timeframe(
 
     since = next_since(last_closed, timeframe) if last_closed is not None else None
 
-    def _fetch() -> list[Candle]:
-        return provider.fetch_ohlcv(
-            symbol, timeframe, since=since, limit=config.candle_limit
-        )
-
-    fetched = call_with_retry(
-        _fetch,
-        retry_max=config.retry_max,
-        backoff_seconds=config.backoff_seconds,
+    fetched = fetch_ohlcv_pages(
+        provider,
+        symbol,
+        timeframe,
+        since=since,
+        config=config,
+        now_ms=now_ms,
         sleep_fn=sleep_fn,
-        retry_exceptions=RETRYABLE,
     )
+    fetched = _unique_keep_first(fetched)
     dump_candles(
         raw_file,
         fetched,
         symbol=symbol,
         timeframe=timeframe,
-        extra={"since": since, "limit": config.candle_limit},
+        extra={"since": since, "limit": _page_limit(config)},
     )
     merged, issues = merge_candles(
         existing,
