@@ -8,13 +8,16 @@ from tradingbot.backtest.models import (
     EquityPoint,
     Trade,
 )
+from tradingbot.backtest.performance import PerformanceReport, analyze_performance
 
 __all__ = [
     "BacktestConfig",
     "BacktestDataset",
     "BacktestResult",
     "EquityPoint",
+    "PerformanceReport",
     "Trade",
+    "analyze_performance",
     "load_backtest_series",
     "run_backtest",
 ]
