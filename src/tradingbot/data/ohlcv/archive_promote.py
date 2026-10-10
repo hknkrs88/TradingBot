@@ -16,6 +16,7 @@ from typing import Any, Callable
 
 from tradingbot.backtest.dataset import load_backtest_series
 from tradingbot.data.io import atomic_write_json, load_json, sha256_file
+from tradingbot.data.ohlcv.archive_import import ArchiveImportError, resolve_archive_series_input
 from tradingbot.data.ohlcv.archive_overlap import (
     COMPARISON_METHOD,
     OHLCV_FIELDS,
@@ -108,7 +109,12 @@ def promote_archive_series(
             _write_report(request.report_path, report)
             return report
 
-    archive_payload = load_decimal_ohlcv_file(request.archive_series_path)
+    try:
+        archive_series_path = resolve_archive_series_input(request.archive_series_path)
+    except ArchiveImportError as exc:
+        raise ArchivePromoteError(f"archive series input rejected: {exc}") from exc
+
+    archive_payload = load_decimal_ohlcv_file(archive_series_path)
     processed_payload = load_decimal_ohlcv_file(series_path)
     load_processed(request.symbol, request.timeframe, root=root)
     manifest = load_json(manifest_path)
@@ -120,7 +126,7 @@ def promote_archive_series(
             processed_payload,
             symbol=request.symbol,
             timeframe=request.timeframe,
-            archive_path=request.archive_series_path.as_posix(),
+            archive_path=archive_series_path.as_posix(),
             processed_path_str=series_path.as_posix(),
         )
     except ArchiveOverlapError as exc:
@@ -146,6 +152,7 @@ def promote_archive_series(
         processed_payload=processed_payload,
         series_path=series_path,
         manifest_path=manifest_path,
+        archive_series_path=archive_series_path,
     )
 
     if overlap["status"] == "failed":
@@ -234,6 +241,7 @@ def _plan_report(
     processed_payload: dict[str, Any],
     series_path: Path,
     manifest_path: Path,
+    archive_series_path: Path,
 ) -> dict[str, Any]:
     archive_n = len(archive_payload.get("candles") or [])
     processed_n = len(processed_payload.get("candles") or [])
@@ -246,8 +254,8 @@ def _plan_report(
         "timeframe": request.timeframe,
         "files_changed": False,
         "sources": {
-            "archive": request.archive_series_path.as_posix(),
-            "archive_sha256": sha256_file(request.archive_series_path),
+            "archive": archive_series_path.as_posix(),
+            "archive_sha256": sha256_file(archive_series_path),
             "processed": series_path.as_posix(),
             "processed_sha256": sha256_file(series_path),
             "manifest": manifest_path.as_posix(),

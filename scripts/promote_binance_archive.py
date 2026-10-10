@@ -18,7 +18,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--root", type=Path, default=ROOT)
     parser.add_argument("--symbol", required=True)
     parser.add_argument("--timeframe", required=True, choices=["1h", "4h"])
-    parser.add_argument("--archive-series", type=Path, required=True)
+    parser.add_argument(
+        "--archive-series",
+        type=Path,
+        required=True,
+        help=(
+            "Experimental candles.json file, generation directory, or series root "
+            "with current.json. Resolved by the live generation pointer. "
+            "Legacy/leftover series-root candles.json is rejected. "
+            "A standalone candles.json with no generation siblings is used as-is."
+        ),
+    )
     parser.add_argument("--report", type=Path, required=True)
     parser.add_argument(
         "--apply",

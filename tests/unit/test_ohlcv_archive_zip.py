@@ -264,6 +264,10 @@ def test_successful_atomic_placement_and_csv_read(tmp_path: Path) -> None:
     assert dest.read_bytes() == payload
     assert placed.sha256 == _sha256(payload)
     assert placed.read_csv_bytes() == csv_payload
+    assert placed.checksum_verified is True
+    assert placed.checksum_path == tmp_path / ref.checksum_name
+    assert placed.checksum_path.is_file()
+    assert placed.checksum_path.read_text(encoding="utf-8") == placed.checksum_text
     assert list(tmp_path.glob("*.tmp")) == []
     assert client.calls == [ref.checksum_url, ref.zip_url]
 

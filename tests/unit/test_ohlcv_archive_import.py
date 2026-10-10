@@ -16,6 +16,7 @@ from tradingbot.data.ohlcv.archive_import import (
     _combine_parsed_groups,
     experimental_series_dir,
     import_archive_klines,
+    resolve_current_generation,
     select_archive_refs,
 )
 from tradingbot.data.ohlcv.archive_zip import ArchiveHttpResponse, monthly_kline_archive_ref
@@ -134,7 +135,9 @@ def test_start_inclusive_end_exclusive(tmp_path: Path) -> None:
     assert report["counts"]["in_range"] == 3
     assert report["counts"]["out_of_range"] == 2
     series_dir = experimental_series_dir(tmp_path / "experimental", "BTCUSDT", "1h")
-    payload = json.loads((series_dir / "candles.json").read_text(encoding="utf-8"))
+    payload = json.loads(
+        (resolve_current_generation(series_dir) / "candles.json").read_text(encoding="utf-8")
+    )
     stamps = [row["timestamp"] for row in payload["candles"]]
     assert stamps == [DEC_START, DEC_START + HOUR, DEC_START + 2 * HOUR]
     assert DEC_START + 3 * HOUR not in stamps
@@ -151,7 +154,9 @@ def test_successful_zip_csv_experimental_series(tmp_path: Path) -> None:
     assert report["periods"][0]["zip_name"] == "BTCUSDT-1h-2024-12.zip"
     assert report["series"]["candle_count"] == 2
     assert report["series"]["first_timestamp"] == DEC_START
-    assert (tmp_path / "experimental" / "BTCUSDT" / "1h" / "import_report.json").is_file()
+    live = resolve_current_generation(tmp_path / "experimental" / "BTCUSDT" / "1h")
+    assert (live / "import_report.json").is_file()
+    assert (tmp_path / "experimental" / "BTCUSDT" / "1h" / "current.json").is_file()
 
 
 def test_missing_archive_http_error_reported(tmp_path: Path) -> None:
@@ -211,9 +216,10 @@ def test_deterministic_sort_and_rerun(tmp_path: Path) -> None:
     second = import_archive_klines(_request(tmp_path, end_exclusive_ms=JAN_START), client=client)
     assert first["series"] == second["series"]
     payload = json.loads(
-        (tmp_path / "experimental" / "BTCUSDT" / "1h" / "candles.json").read_text(
-            encoding="utf-8"
-        )
+        (
+            resolve_current_generation(tmp_path / "experimental" / "BTCUSDT" / "1h")
+            / "candles.json"
+        ).read_text(encoding="utf-8")
     )
     assert [row["timestamp"] for row in payload["candles"]] == [DEC_START, DEC_START + HOUR]
 
@@ -262,7 +268,10 @@ def test_does_not_write_processed_or_manifest(tmp_path: Path) -> None:
     )
     assert manifest.read_text(encoding="utf-8") == "MANIFEST"
     assert series.read_text(encoding="utf-8") == "PROCESSED"
-    assert (tmp_path / "data" / "experimental" / "binance_archive" / "BTCUSDT" / "1h" / "candles.json").is_file()
+    live = resolve_current_generation(
+        tmp_path / "data" / "experimental" / "binance_archive" / "BTCUSDT" / "1h"
+    )
+    assert (live / "candles.json").is_file()
 
 
 def test_refuses_processed_dest(tmp_path: Path) -> None:

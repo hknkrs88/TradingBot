@@ -84,6 +84,10 @@ class VerifiedKlineArchive:
     zip_path: Path
     sha256: str
     csv_name: str
+    checksum_path: Path
+    checksum_text: str
+    checksum_sha256: str
+    checksum_verified: bool
 
     def read_csv_bytes(self) -> bytes:
         """Read the single verified CSV member from the placed ZIP."""
@@ -155,6 +159,7 @@ def fetch_verified_kline_archive(
     """Download checksum + ZIP to temp files, verify, then atomically place the ZIP."""
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest = dest_dir / ref.zip_name
+    checksum_dest = dest_dir / ref.checksum_name
     tmp_zip = dest.with_name(dest.name + ".tmp")
     tmp_sum = dest_dir / (ref.checksum_name + ".tmp")
 
@@ -182,16 +187,20 @@ def fetch_verified_kline_archive(
             )
         csv_name = inspect_kline_zip(zip_resp.body, expected_csv_name=ref.csv_name)
         os.replace(tmp_zip, dest)
+        os.replace(tmp_sum, checksum_dest)
     except Exception:
         _unlink_if_exists(tmp_zip)
         _unlink_if_exists(tmp_sum)
         raise
-    _unlink_if_exists(tmp_sum)
     return VerifiedKlineArchive(
         ref=ref,
         zip_path=dest,
         sha256=actual_digest,
         csv_name=csv_name,
+        checksum_path=checksum_dest,
+        checksum_text=checksum_text,
+        checksum_sha256=hashlib.sha256(checksum_resp.body).hexdigest(),
+        checksum_verified=True,
     )
 
 

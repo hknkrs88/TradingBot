@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import csv
 import io
+import json
 import os
+import re
 import shutil
 import time
 import urllib.error
@@ -13,14 +15,24 @@ from collections import Counter
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from uuid import uuid4
 
-from tradingbot.data.io import atomic_write_json
+from tradingbot.data.io import atomic_write_json, load_json, sha256_file
 from tradingbot.data.ohlcv.archive_csv import (
     ArchiveKlineParseError,
     month_period_ms,
     parse_archive_kline_rows,
+)
+from tradingbot.data.ohlcv.archive_provenance import (
+    PROVENANCE_FILENAME,
+    ArchiveProvenanceError,
+    archive_record,
+    build_provenance_payload,
+    provenance_ref,
+    validate_provenance_payload,
+    validate_report_provenance_link,
+    write_provenance,
 )
 from tradingbot.data.ohlcv.archive_zip import (
     ARCHIVE_BASE,
@@ -31,6 +43,7 @@ from tradingbot.data.ohlcv.archive_zip import (
     daily_kline_archive_ref,
     fetch_verified_kline_archive,
     monthly_kline_archive_ref,
+    parse_checksum_file,
 )
 from tradingbot.data.ohlcv.models import Candle
 from tradingbot.data.ohlcv.quality import filter_candles
@@ -38,7 +51,11 @@ from tradingbot.data.ohlcv.store import dump_candles, safe_symbol
 from tradingbot.data.ohlcv.timeframes import UnsupportedTimeframeError, timeframe_ms
 
 REPORT_SCHEMA = "binance_archive_import_report/v1"
+CURRENT_SCHEMA = "binance_archive_current/v1"
+CURRENT_FILENAME = "current.json"
 EXPERIMENTAL_REL = Path("data") / "experimental" / "binance_archive"
+_GENERATION_RE = re.compile(r"^v-[0-9a-f]{32}$")
+ReplaceFn = Callable[[Path, Path], None]
 
 
 class ArchiveImportError(ValueError):
@@ -82,6 +99,142 @@ def experimental_series_dir(dest_root: Path, symbol: str, timeframe: str) -> Pat
     return dest_root / safe_symbol(symbol) / timeframe
 
 
+def _checkpoint(crash_at: str | None, name: str) -> None:
+    if crash_at == name:
+        os._exit(91)
+
+
+def current_pointer_path(series_dir: Path) -> Path:
+    return series_dir / CURRENT_FILENAME
+
+
+def resolve_current_generation(series_dir: Path) -> Path:
+    """Return the live generation directory. Fail-closed; never reads legacy root files."""
+    pointer = current_pointer_path(series_dir)
+    if not pointer.is_file():
+        raise ArchiveImportError("experimental current.json missing")
+    try:
+        payload = load_json(pointer)
+    except Exception as exc:
+        raise ArchiveImportError("experimental current.json is invalid") from exc
+    if not isinstance(payload, dict) or payload.get("schema") != CURRENT_SCHEMA:
+        raise ArchiveImportError("unsupported experimental current schema")
+    if payload.get("experimental") is not True:
+        raise ArchiveImportError("experimental current.json must be experimental")
+    generation = payload.get("generation")
+    path_token = payload.get("path")
+    if generation != path_token or not isinstance(generation, str):
+        raise ArchiveImportError("experimental current.json generation path mismatch")
+    if not _GENERATION_RE.fullmatch(generation):
+        raise ArchiveImportError("experimental current.json generation id invalid")
+    generation_dir = (series_dir / generation).resolve()
+    try:
+        generation_dir.relative_to(series_dir.resolve())
+    except ValueError as exc:
+        raise ArchiveImportError("experimental generation escapes series dir") from exc
+    if not generation_dir.is_dir():
+        raise ArchiveImportError(f"experimental generation missing: {generation}")
+    validate_generation_dir(generation_dir)
+    return generation_dir
+
+
+def resolve_archive_series_input(path: Path) -> Path:
+    """Resolve --archive-series to a candles.json file.
+
+    Directories use the live generation resolver. A candles.json file inside a
+    validated generation is accepted after integrity checks. Leftover series-root
+    candles.json (beside current.json or generation dirs) is rejected. A
+    standalone candles.json with no generation/pointer siblings is returned as-is.
+    """
+    if path.is_file():
+        return _resolve_archive_series_file(path)
+    if not path.is_dir():
+        raise ArchiveImportError(f"archive series path missing: {path}")
+    if current_pointer_path(path).is_file():
+        return resolve_current_generation(path) / "candles.json"
+    if (path / "import_report.json").is_file() and (path / PROVENANCE_FILENAME).is_file():
+        validate_generation_dir(path)
+        return path / "candles.json"
+    if (path / "candles.json").is_file():
+        raise ArchiveImportError(
+            "legacy root candles.json is not live; pass a generation directory, "
+            "a series directory with current.json, or an explicit candles.json file"
+        )
+    raise ArchiveImportError("unable to resolve experimental archive series path")
+
+
+def _resolve_archive_series_file(path: Path) -> Path:
+    parent = path.parent
+    if path.name == "candles.json" and (parent / "import_report.json").is_file() and (
+        parent / PROVENANCE_FILENAME
+    ).is_file():
+        validate_generation_dir(parent)
+        return path
+    if path.name == "candles.json" and current_pointer_path(parent).is_file():
+        raise ArchiveImportError(
+            "legacy root candles.json is not live; pass a generation directory, "
+            "a series directory with current.json, or the live generation candles.json"
+        )
+    if path.name == "candles.json" and any(
+        child.is_dir() and _GENERATION_RE.fullmatch(child.name) for child in parent.iterdir()
+    ):
+        raise ArchiveImportError(
+            "legacy root candles.json is not live; pass a generation directory or "
+            "a series directory with current.json"
+        )
+    return path
+
+
+def validate_generation_dir(generation_dir: Path) -> None:
+    candles = generation_dir / "candles.json"
+    report_path = generation_dir / "import_report.json"
+    if not candles.is_file():
+        raise ArchiveImportError("generation candles.json missing")
+    if not report_path.is_file():
+        raise ArchiveImportError("generation import_report.json missing")
+    try:
+        report = load_json(report_path)
+    except Exception as exc:
+        raise ArchiveImportError("generation import_report.json invalid") from exc
+    if not isinstance(report, dict):
+        raise ArchiveImportError("generation import_report.json invalid")
+    try:
+        validate_report_provenance_link(report, generation_dir)
+    except ArchiveProvenanceError as exc:
+        raise ArchiveImportError(f"generation provenance inconsistent: {exc}") from exc
+    try:
+        provenance = load_json(generation_dir / PROVENANCE_FILENAME)
+    except Exception as exc:
+        raise ArchiveImportError("generation provenance.json invalid") from exc
+    if not isinstance(provenance, dict):
+        raise ArchiveImportError("generation provenance.json invalid")
+    expected_candles = provenance.get("candles_sha256")
+    actual_candles = sha256_file(candles)
+    if expected_candles != actual_candles:
+        raise ArchiveImportError(
+            f"generation candles hash mismatch expected={expected_candles} actual={actual_candles}"
+        )
+    checksum_dir = generation_dir / "checksums"
+    for record in provenance.get("archives") or []:
+        name = str(record.get("checksum_name") or "")
+        checksum_path = checksum_dir / name
+        if not name or not checksum_path.is_file():
+            raise ArchiveImportError(f"generation checksum missing: {name}")
+        try:
+            text = checksum_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise ArchiveImportError(f"generation checksum unreadable: {name}") from exc
+        try:
+            parsed = parse_checksum_file(text, expected_zip_name=str(record.get("zip_name") or ""))
+        except Exception as exc:
+            raise ArchiveImportError(f"generation checksum invalid: {name}") from exc
+        if parsed != record.get("zip_sha256"):
+            raise ArchiveImportError(f"generation checksum zip sha256 mismatch: {name}")
+        actual_sum = sha256_file(checksum_path)
+        if actual_sum != record.get("checksum_sha256"):
+            raise ArchiveImportError(f"generation checksum file hash mismatch: {name}")
+
+
 def select_archive_refs(
     symbol: str,
     timeframe: str,
@@ -105,6 +258,9 @@ def import_archive_klines(
     request: ArchiveImportRequest,
     *,
     client: ArchiveHttpClient,
+    replace_fn: ReplaceFn | None = None,
+    crash_at: str | None = None,
+    generation_id: str | None = None,
 ) -> dict[str, Any]:
     try:
         timeframe_ms(request.timeframe)
@@ -128,6 +284,7 @@ def import_archive_klines(
     now_ms = request.now_ms if request.now_ms is not None else int(time.time() * 1000)
 
     periods: list[dict[str, Any]] = []
+    archive_records: list[dict[str, Any]] = []
     parsed_groups: list[list[Candle]] = []
     fetched_rows = 0
     try:
@@ -159,6 +316,23 @@ def import_archive_klines(
                     f"archive period {ref.zip_name} failed: {exc}"
                 ) from exc
             parsed_groups.append(candles)
+            record = archive_record(
+                zip_name=verified.ref.zip_name,
+                zip_sha256=verified.sha256,
+                checksum_name=verified.ref.checksum_name,
+                checksum_text=verified.checksum_text,
+                checksum_sha256=verified.checksum_sha256,
+                checksum_verified=verified.checksum_verified,
+                csv_name=verified.csv_name,
+                period_start_ms=period_start,
+                period_end_exclusive_ms=period_end,
+                symbol=request.symbol,
+                timeframe=request.timeframe,
+                cadence=verified.ref.cadence,
+                zip_url=verified.ref.zip_url,
+                checksum_url=verified.ref.checksum_url,
+            )
+            archive_records.append(record)
             periods.append(
                 {
                     "zip_name": ref.zip_name,
@@ -167,6 +341,9 @@ def import_archive_klines(
                     "url": ref.zip_url,
                     "status": "ok",
                     "parsed": len(candles),
+                    "period_start_ms": period_start,
+                    "period_end_exclusive_ms": period_end,
+                    "checksum_verified": True,
                 }
             )
 
@@ -189,6 +366,14 @@ def import_archive_klines(
         else:
             status = "success"
 
+        provenance = build_provenance_payload(
+            symbol=request.symbol,
+            timeframe=request.timeframe,
+            cadence=request.cadence,
+            range_start_ms=request.start_ms,
+            range_end_exclusive_ms=request.end_exclusive_ms,
+            archives=archive_records,
+        )
         report = _build_report(
             request=request,
             status=status,
@@ -202,7 +387,21 @@ def import_archive_klines(
         )
         if status == "failed":
             raise ArchiveImportError("no in-range candles; one or more archive periods missing")
-        _publish(series_dir, staging, request, quality_candles, report)
+        _publish(
+            series_dir,
+            staging,
+            request,
+            quality_candles,
+            report,
+            provenance,
+            replace_fn=replace_fn,
+            crash_at=crash_at,
+            generation_id=generation_id,
+        )
+        live = resolve_current_generation(series_dir)
+        report["generation"] = live.name
+        report["current_path"] = current_pointer_path(series_dir).as_posix()
+        report["candles_path"] = (live / "candles.json").as_posix()
         return report
     except Exception:
         if staging.exists():
@@ -337,10 +536,21 @@ def _publish(
     request: ArchiveImportRequest,
     candles: list[Candle],
     report: dict[str, Any],
+    provenance: dict[str, Any],
+    *,
+    replace_fn: ReplaceFn | None = None,
+    crash_at: str | None = None,
+    generation_id: str | None = None,
 ) -> None:
+    """Publish an immutable generation, then flip current.json with one os.replace."""
+    replacer = replace_fn or os.replace
+    token = generation_id or f"v-{uuid4().hex}"
+    if not _GENERATION_RE.fullmatch(token):
+        raise ArchiveImportError("generation id invalid")
     staging.mkdir(parents=True, exist_ok=True)
     candles_tmp = staging / "candles.json"
     report_tmp = staging / "import_report.json"
+    provenance_tmp = staging / PROVENANCE_FILENAME
     dump_candles(
         candles_tmp,
         candles,
@@ -352,10 +562,68 @@ def _publish(
             "schema": REPORT_SCHEMA,
         },
     )
-    atomic_write_json(report_tmp, report)
+    provenance = dict(provenance)
+    provenance["candles_sha256"] = sha256_file(candles_tmp)
+    try:
+        validate_provenance_payload(provenance)
+        digest = write_provenance(provenance_tmp, provenance)
+        report["provenance"] = provenance_ref(digest)
+        report["generation"] = token
+        atomic_write_json(report_tmp, report)
+        validate_report_provenance_link(report, staging, provenance_sha256=digest)
+    except ArchiveProvenanceError as exc:
+        raise ArchiveImportError(f"provenance validation failed: {exc}") from exc
     series_dir.mkdir(parents=True, exist_ok=True)
-    os.replace(candles_tmp, series_dir / "candles.json")
-    os.replace(report_tmp, series_dir / "import_report.json")
+    _checkpoint(crash_at, "before_generation")
+    generation_dir = series_dir / token
+    generation_dir.mkdir(parents=False, exist_ok=False)
+    checksum_dir = generation_dir / "checksums"
+    checksum_dir.mkdir(parents=True, exist_ok=True)
+    zip_dir = staging / "zips"
+    try:
+        for record in provenance["archives"]:
+            checksum_name = str(record["checksum_name"])
+            src = zip_dir / checksum_name
+            if not src.is_file():
+                raise ArchiveImportError(f"verified checksum missing in staging: {checksum_name}")
+            replacer(src, checksum_dir / checksum_name)
+        _checkpoint(crash_at, "after_checksum")
+        replacer(provenance_tmp, generation_dir / PROVENANCE_FILENAME)
+        _checkpoint(crash_at, "after_provenance")
+        replacer(candles_tmp, generation_dir / "candles.json")
+        _checkpoint(crash_at, "after_candles")
+        replacer(report_tmp, generation_dir / "import_report.json")
+        _checkpoint(crash_at, "after_report")
+    except OSError as exc:
+        raise ArchiveImportError(
+            f"generation publish failed; current pointer unchanged: {exc}"
+        ) from exc
+    try:
+        validate_generation_dir(generation_dir)
+    except ArchiveImportError:
+        raise
+    _checkpoint(crash_at, "after_generation_validated")
+    pointer = {
+        "schema": CURRENT_SCHEMA,
+        "experimental": True,
+        "generation": token,
+        "path": token,
+    }
+    pointer_tmp = series_dir / (CURRENT_FILENAME + ".tmp")
+    pointer_tmp.write_text(
+        json.dumps(pointer, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    try:
+        replacer(pointer_tmp, current_pointer_path(series_dir))
+    except OSError as exc:
+        if pointer_tmp.exists():
+            pointer_tmp.unlink(missing_ok=True)
+        raise ArchiveImportError(
+            f"current pointer publish failed; generation is not live: {exc}"
+        ) from exc
+    _checkpoint(crash_at, "after_current")
+    resolve_current_generation(series_dir)
 
 
 def _refuse_processed_dest(dest_root: Path) -> None:

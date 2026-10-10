@@ -6,6 +6,7 @@ import argparse
 import sys
 from pathlib import Path
 
+from tradingbot.data.ohlcv.archive_import import resolve_archive_series_input
 from tradingbot.data.ohlcv.archive_overlap import analyze_archive_processed_files
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -22,7 +23,12 @@ def main(argv: list[str] | None = None) -> int:
         "--archive-series",
         type=Path,
         required=True,
-        help="Path to experimental candles.json",
+        help=(
+            "File path to experimental candles.json (used as-is). "
+            "A generation directory or experimental series root with current.json "
+            "is resolved via the live generation pointer. "
+            "Legacy series-root candles.json without current.json is not used."
+        ),
     )
     parser.add_argument(
         "--report",
@@ -33,11 +39,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--mismatch-example-limit", type=int, default=20)
     args = parser.parse_args(argv)
 
+    archive_series = args.archive_series
+    if archive_series.is_dir():
+        archive_series = resolve_archive_series_input(archive_series)
     report = analyze_archive_processed_files(
         root=args.root,
         symbol=args.symbol,
         timeframe=args.timeframe,
-        archive_series_path=args.archive_series,
+        archive_series_path=archive_series,
         report_path=args.report,
         mismatch_example_limit=args.mismatch_example_limit,
     )

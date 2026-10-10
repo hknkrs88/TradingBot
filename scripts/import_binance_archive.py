@@ -29,7 +29,7 @@ def _parse_utc_ms(value: str) -> int:
     return int(dt.timestamp()) * 1000
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: list[str] | None = None, *, client=None) -> int:
     parser = argparse.ArgumentParser(
         description="Experimental Binance archive import (not processed OHLCV sync)"
     )
@@ -56,14 +56,18 @@ def main(argv: list[str] | None = None) -> int:
         cadence=args.cadence,
         dest_root=dest_root,
     )
-    report = import_archive_klines(request, client=UrllibArchiveHttpClient())
+    report = import_archive_klines(request, client=client or UrllibArchiveHttpClient())
     print(
-        "status={status} symbol={symbol} tf={tf} candles={n} periods={p}".format(
+        "status={status} symbol={symbol} tf={tf} candles={n} periods={p} "
+        "generation={generation} current={current} candles_path={candles_path}".format(
             status=report["status"],
             symbol=report["symbol"],
             tf=report["timeframe"],
             n=report["series"]["candle_count"],
             p=len(report["periods"]),
+            generation=report.get("generation"),
+            current=report.get("current_path"),
+            candles_path=report.get("candles_path"),
         )
     )
     return 0 if report["status"] != "failed" else 1
