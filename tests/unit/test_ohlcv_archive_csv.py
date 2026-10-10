@@ -1,4 +1,7 @@
+import json
 from datetime import UTC, datetime
+from decimal import Decimal
+from pathlib import Path
 
 import pytest
 
@@ -9,6 +12,7 @@ from tradingbot.data.ohlcv.archive_csv import (
     parse_archive_kline_rows,
 )
 from tradingbot.data.ohlcv.models import Candle
+from tradingbot.data.ohlcv.store import dump_candles
 
 HOUR = 3_600_000
 DEC_2024 = month_period_ms(2024, 12)
@@ -195,6 +199,29 @@ def test_same_input_is_deterministic() -> None:
     first = _parse(row)
     second = _parse(row)
     assert first == second
+
+
+def test_float_json_roundtrip_does_not_preserve_high_precision_csv_token(tmp_path: Path) -> None:
+    csv_token = "0.1234567890123456789"
+    original = Decimal(csv_token)
+    open_ms = 1733011200000
+    candle = _parse(
+        _fields(
+            open_ms,
+            open_ms + HOUR - 1,
+            open_="1",
+            high="1",
+            low="0",
+            close=csv_token,
+            volume="1",
+        )
+    )
+    path = tmp_path / "candles.json"
+    dump_candles(path, [candle], symbol="BTCUSDT", timeframe="1h")
+    payload = json.loads(path.read_text(encoding="utf-8"), parse_float=Decimal)
+    json_close = payload["candles"][0]["close"]
+    assert isinstance(json_close, Decimal)
+    assert json_close != original
 
 
 def test_does_not_fill_hourly_gaps() -> None:

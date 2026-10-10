@@ -23,7 +23,8 @@ COMPARISON_METHOD = {
     "equality": "Decimal exact equality on JSON number tokens",
     "not_used": "Candle.float and binary float equality",
     "limitation": (
-        "JSON tokens are used, not original Binance CSV strings. "
+        "Compares JSON number tokens parsed as Decimal, not original CSV cell tokens. "
+        "Matched JSON Decimals do not prove CSV text equality. "
         "Imported series may already have been round-tripped through float."
     ),
 }

@@ -1,6 +1,8 @@
 """Experimental Binance archive provenance records.
 
 Records ZIP SHA-256, checksum text, CSV member name, and period bounds.
+candles_sha256 is the SHA-256 of that generation's candles.json file bytes
+(float JSON from dump_candles). It does not hash original CSV cell tokens.
 Does not change Candle, processed OHLCV, or promotion.
 
 Live experimental output is a generation directory selected by current.json.

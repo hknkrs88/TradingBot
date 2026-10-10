@@ -1,5 +1,9 @@
 """Parse Binance Spot archive kline CSV rows into Candle.
 
+CSV OHLCV cells are parsed as Decimal, then converted with float() when the
+Candle is built. Original CSV token precision can be lost at that conversion;
+the Candle model does not retain the CSV text.
+
 No network, ZIP, checksum, disk store, or sync_ohlcv integration.
 Timestamps are normalized to milliseconds at this boundary only.
 """
@@ -83,6 +87,7 @@ def parse_archive_kline_row(
     )
     _validate_ohlcv(open_dec, high_dec, low_dec, close_dec, volume_dec)
 
+    # First irreversible precision loss vs original CSV decimal text.
     return Candle(
         timestamp=open_ms,
         open=float(open_dec),
