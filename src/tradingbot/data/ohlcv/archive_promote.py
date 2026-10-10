@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from tradingbot.backtest.dataset import load_backtest_series
-from tradingbot.data.io import atomic_write_json, load_json, sha256_file
+from tradingbot.data.io import InvalidCacheError, atomic_write_json, load_json, sha256_file
 from tradingbot.data.ohlcv.archive_import import ArchiveImportError, resolve_archive_series_input
 from tradingbot.data.ohlcv.archive_overlap import (
     COMPARISON_METHOD,
@@ -37,6 +37,7 @@ from tradingbot.data.ohlcv.timeframes import timeframe_ms
 PROMOTE_SCHEMA = "binance_archive_promote_report/v1"
 JOURNAL_SCHEMA = "binance_archive_promote_journal/v1"
 _SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
+_SAFE_READER_JOURNAL_KINDS = frozenset({"none", "stale_unpublished", "complete"})
 _REQUIRED_JOURNAL_HASH_FIELDS = (
     "pre_series_sha256",
     "pre_manifest_sha256",
@@ -51,6 +52,11 @@ CopyFn = Callable[[Path, Path], None]
 
 class ArchivePromoteError(ValueError):
     """Promotion cannot proceed safely."""
+
+
+def promote_journal_dir(root: Path, symbol: str, timeframe: str) -> Path:
+    processed_root = Path(root) / "data" / "processed" / "ohlcv"
+    return processed_root / ".promote_journal" / f"{safe_symbol(symbol)}_{timeframe}"
 
 
 @dataclass(frozen=True)
@@ -91,7 +97,7 @@ def promote_archive_series(
     processed_root = root / "data" / "processed" / "ohlcv"
     series_path = processed_path(processed_root, request.symbol, request.timeframe)
     manifest_path = processed_root / f"manifest_{request.timeframe}.json"
-    journal_dir = processed_root / ".promote_journal" / f"{safe_symbol(request.symbol)}_{request.timeframe}"
+    journal_dir = promote_journal_dir(root, request.symbol, request.timeframe)
 
     if request.apply:
         early = _reconcile_journal(journal_dir, series_path, manifest_path)
@@ -809,6 +815,27 @@ def _reconcile_journal(
         f"(series={current_s} manifest={current_m} state={payload.get('state')})"
     )
     return result
+
+
+def inspect_promote_journal(root: Path, symbol: str, timeframe: str) -> dict[str, Any]:
+    """Classify leftover promote journal vs live series/manifest hashes. Read-only."""
+    processed_root = Path(root) / "data" / "processed" / "ohlcv"
+    series_path = processed_path(processed_root, symbol, timeframe)
+    manifest_path = processed_root / f"manifest_{timeframe}.json"
+    return _reconcile_journal(promote_journal_dir(root, symbol, timeframe), series_path, manifest_path)
+
+
+def refuse_unsafe_promote_journal(root: Path, symbol: str, timeframe: str) -> None:
+    """Fail-closed for mixed or untrusted promote journals. Does not repair or write.
+
+    Inspect-then-read is not atomic (TOCTOU). Does not wrap load_candles().
+    """
+    inspection = inspect_promote_journal(root, symbol, timeframe)
+    kind = str(inspection.get("kind") or "ambiguous")
+    if kind in _SAFE_READER_JOURNAL_KINDS:
+        return
+    detail = str(inspection.get("detail") or kind)
+    raise InvalidCacheError(f"unsafe_promote_journal:{kind}:{detail}")
 
 
 def _require_backup(path: Path, expected_sha: str | None, label: str) -> None:

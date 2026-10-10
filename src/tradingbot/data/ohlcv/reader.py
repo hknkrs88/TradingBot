@@ -1,4 +1,8 @@
-"""Read processed OHLCV from disk. No network, no provider, no orders."""
+"""Read processed OHLCV from disk. No network, no provider, no orders.
+
+load_processed refuses unsafe leftover promote journals. Direct load_candles()
+does not; that bypass is out of A2 scope.
+"""
 
 from __future__ import annotations
 
@@ -12,6 +16,9 @@ from tradingbot.data.ohlcv.timeframes import timeframe_ms
 
 def load_processed(symbol: str, timeframe: str, *, root: Path) -> list[Candle]:
     timeframe_ms(timeframe)
+    from tradingbot.data.ohlcv.archive_promote import refuse_unsafe_promote_journal
+
+    refuse_unsafe_promote_journal(root, symbol, timeframe)
     path = processed_path(Path(root) / "data" / "processed" / "ohlcv", symbol, timeframe)
     try:
         return load_candles(path)

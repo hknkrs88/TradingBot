@@ -95,6 +95,9 @@ def load_backtest_series(
     from_name = _timeframe_from_filename(given_manifest)
     if from_name is not None and from_name != timeframe:
         raise ValueError("manifest filename timeframe mismatch")
+    from tradingbot.data.ohlcv.archive_promote import refuse_unsafe_promote_journal
+
+    refuse_unsafe_promote_journal(root_path, symbol, timeframe)
 
     universe = payload.get("universe")
     if not isinstance(universe, dict):
