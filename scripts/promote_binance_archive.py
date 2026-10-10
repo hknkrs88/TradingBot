@@ -49,7 +49,7 @@ def main(argv: list[str] | None = None) -> int:
             reason=report.get("failure_reason") or report.get("apply_blocked_reason") or "",
         )
     )
-    return 0 if report["status"] in {"dry_run", "applied"} else 1
+    return 0 if report["status"] in {"dry_run", "applied", "recovered_complete"} else 1
 
 
 if __name__ == "__main__":
