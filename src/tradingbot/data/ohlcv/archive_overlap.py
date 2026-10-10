@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from tradingbot.data.io import atomic_write_json
+from tradingbot.data.ohlcv.archive_import import ArchiveImportError, resolve_archive_series_input
 from tradingbot.data.ohlcv.reader import load_processed
 from tradingbot.data.ohlcv.store import processed_path, safe_symbol
 from tradingbot.data.ohlcv.timeframes import timeframe_ms
@@ -202,6 +203,10 @@ def analyze_archive_processed_files(
 ) -> dict[str, Any]:
     timeframe_ms(timeframe)
     _refuse_processed_path(report_path)
+    try:
+        archive_series_path = resolve_archive_series_input(archive_series_path)
+    except ArchiveImportError as exc:
+        raise ArchiveOverlapError(f"archive series input rejected: {exc}") from exc
     processed_file = processed_path(
         Path(root) / "data" / "processed" / "ohlcv", symbol, timeframe
     )
