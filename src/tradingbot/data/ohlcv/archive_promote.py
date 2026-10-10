@@ -56,13 +56,21 @@ def replace_file(src: Path, dst: Path) -> None:
     os.replace(src, dst)
 
 
+def _checkpoint(crash_at: str | None, name: str) -> None:
+    if crash_at == name:
+        os._exit(91)
+
+
 def promote_archive_series(
     request: ArchivePromoteRequest,
     *,
     replace_fn: ReplaceFn | None = None,
+    crash_at: str | None = None,
+    loader_fn: Callable[..., Any] | None = None,
 ) -> dict[str, Any]:
     """Dry-run by default. Writes processed files only when request.apply is true."""
     replacer = replace_fn or replace_file
+    loader = loader_fn or load_backtest_series
     timeframe_ms(request.timeframe)
     _refuse_processed_report(request.report_path)
     root = request.root
@@ -70,6 +78,59 @@ def promote_archive_series(
     series_path = processed_path(processed_root, request.symbol, request.timeframe)
     manifest_path = processed_root / f"manifest_{request.timeframe}.json"
     journal_dir = processed_root / ".promote_journal" / f"{safe_symbol(request.symbol)}_{request.timeframe}"
+
+    if request.apply:
+        early = _reconcile_journal(journal_dir, series_path, manifest_path)
+        if early["kind"] == "complete":
+            shutil.rmtree(journal_dir, ignore_errors=True)
+            report = {
+                "schema": PROMOTE_SCHEMA,
+                "experimental": True,
+                "mode": "apply",
+                "status": "recovered_complete",
+                "files_changed": False,
+                "symbol": safe_symbol(request.symbol),
+                "timeframe": request.timeframe,
+                "failure_reason": None,
+                "warnings": [],
+                "journal_inspection": {
+                    "kind": early["kind"],
+                    "detail": early["detail"],
+                    "failed_checks": early["failed_checks"],
+                },
+                "after": {
+                    "processed_sha256": sha256_file(series_path),
+                    "manifest_sha256": sha256_file(manifest_path),
+                },
+                "manifest_validation": "ok",
+                "comparison_method": COMPARISON_METHOD,
+            }
+            _write_report(request.report_path, report)
+            return report
+        if early["kind"] != "none":
+            report = {
+                "schema": PROMOTE_SCHEMA,
+                "experimental": True,
+                "mode": "apply",
+                "status": "rejected",
+                "files_changed": early["kind"] in {
+                    "series_only",
+                    "ambiguous",
+                    "backup_invalid",
+                },
+                "symbol": safe_symbol(request.symbol),
+                "timeframe": request.timeframe,
+                "failure_reason": f"incomplete_promote_journal:{early['kind']}",
+                "warnings": ["promote_journal_present"],
+                "journal_inspection": {
+                    "kind": early["kind"],
+                    "detail": early["detail"],
+                    "failed_checks": early["failed_checks"],
+                },
+                "comparison_method": COMPARISON_METHOD,
+            }
+            _write_report(request.report_path, report)
+            return report
 
     archive_payload = load_decimal_ohlcv_file(request.archive_series_path)
     processed_payload = load_decimal_ohlcv_file(series_path)
@@ -147,13 +208,6 @@ def promote_archive_series(
         _write_report(request.report_path, report)
         return report
 
-    if journal_dir.exists():
-        report["status"] = "rejected"
-        report["failure_reason"] = "incomplete_promote_journal"
-        report["files_changed"] = False
-        _write_report(request.report_path, report)
-        return report
-
     try:
         _apply_transaction(
             request=request,
@@ -163,11 +217,24 @@ def promote_archive_series(
             manifest_path=manifest_path,
             journal_dir=journal_dir,
             replace_fn=replacer,
+            crash_at=crash_at,
+            loader_fn=loader,
         )
     except Exception as exc:
         report["status"] = "failed"
         report["failure_reason"] = str(exc)
-        report["files_changed"] = _files_changed_from_journal(journal_dir, series_path, manifest_path)
+        inspection = _reconcile_journal(journal_dir, series_path, manifest_path)
+        report["journal_inspection"] = {
+            "kind": inspection["kind"],
+            "detail": inspection["detail"],
+            "failed_checks": inspection["failed_checks"],
+        }
+        report["files_changed"] = inspection["kind"] in {
+            "series_only",
+            "complete",
+            "ambiguous",
+            "backup_invalid",
+        }
         if journal_dir.exists():
             report["warnings"].append("promote_journal_present_after_failure")
         _write_report(request.report_path, report)
@@ -341,6 +408,8 @@ def _apply_transaction(
     manifest_path: Path,
     journal_dir: Path,
     replace_fn: ReplaceFn,
+    crash_at: str | None = None,
+    loader_fn: Callable[..., Any] = load_backtest_series,
 ) -> None:
     journal_dir.mkdir(parents=True, exist_ok=True)
     backup_series = journal_dir / "backup_series.json"
@@ -349,16 +418,14 @@ def _apply_transaction(
     new_manifest = journal_dir / "new_manifest.json"
     shutil.copyfile(series_path, backup_series)
     shutil.copyfile(manifest_path, backup_manifest)
-    _write_journal(
-        journal_dir,
-        state="backed_up",
-        series_path=series_path,
-        manifest_path=manifest_path,
-        backup_series=backup_series,
-        backup_manifest=backup_manifest,
-        pre_series_sha256=sha256_file(backup_series),
-        pre_manifest_sha256=sha256_file(backup_manifest),
-    )
+    pre_series = sha256_file(series_path)
+    pre_manifest = sha256_file(manifest_path)
+    backup_series_sha = sha256_file(backup_series)
+    backup_manifest_sha = sha256_file(backup_manifest)
+    if backup_series_sha != pre_series:
+        raise ArchivePromoteError("backup_series hash mismatch after copy")
+    if backup_manifest_sha != pre_manifest:
+        raise ArchivePromoteError("backup_manifest hash mismatch after copy")
     dump_candles(
         new_series,
         merged,
@@ -372,10 +439,29 @@ def _apply_transaction(
         raise ArchivePromoteError("rewritten series length mismatch")
     updated = _updated_manifest(manifest, request, new_series, reloaded)
     atomic_write_json(new_manifest, updated)
+    hashes = {
+        "pre_series_sha256": pre_series,
+        "pre_manifest_sha256": pre_manifest,
+        "backup_series_sha256": backup_series_sha,
+        "backup_manifest_sha256": backup_manifest_sha,
+        "planned_series_sha256": sha256_file(new_series),
+        "planned_manifest_sha256": sha256_file(new_manifest),
+    }
+    _write_journal(
+        journal_dir,
+        state="backed_up",
+        series_path=series_path,
+        manifest_path=manifest_path,
+        backup_series=backup_series,
+        backup_manifest=backup_manifest,
+        **hashes,
+    )
+    _checkpoint(crash_at, "after_backed_up")
     series_published = False
     try:
         replace_fn(new_series, series_path)
         series_published = True
+        _checkpoint(crash_at, "after_series_replace")
         _write_journal(
             journal_dir,
             state="series_published",
@@ -383,10 +469,11 @@ def _apply_transaction(
             manifest_path=manifest_path,
             backup_series=backup_series,
             backup_manifest=backup_manifest,
-            pre_series_sha256=sha256_file(backup_series),
-            pre_manifest_sha256=sha256_file(backup_manifest),
+            **hashes,
         )
+        _checkpoint(crash_at, "after_series_published")
         replace_fn(new_manifest, manifest_path)
+        _checkpoint(crash_at, "after_manifest_replace")
         _write_journal(
             journal_dir,
             state="committed",
@@ -394,10 +481,10 @@ def _apply_transaction(
             manifest_path=manifest_path,
             backup_series=backup_series,
             backup_manifest=backup_manifest,
-            pre_series_sha256=sha256_file(backup_series),
-            pre_manifest_sha256=sha256_file(backup_manifest),
+            **hashes,
         )
-        load_backtest_series(
+        _checkpoint(crash_at, "after_committed")
+        loader_fn(
             Path("data/processed/ohlcv") / f"manifest_{request.timeframe}.json",
             processed_payload_symbol(manifest, request.symbol),
             root=request.root,
@@ -454,6 +541,115 @@ def _write_journal(journal_dir: Path, **payload: Any) -> None:
     atomic_write_json(journal_dir / "journal.json", clean)
 
 
+def _read_journal(journal_dir: Path) -> dict[str, Any] | None:
+    path = journal_dir / "journal.json"
+    if not journal_dir.exists():
+        return None
+    if not path.is_file():
+        return {}
+    try:
+        payload = load_json(path)
+    except Exception:
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    return payload
+
+
+def _hash_if_file(path: Path) -> str | None:
+    if not path.is_file():
+        return None
+    return sha256_file(path)
+
+
+def _reconcile_journal(
+    journal_dir: Path, series_path: Path, manifest_path: Path
+) -> dict[str, Any]:
+    """Classify leftover journal vs on-disk hashes. Never assumes files are correct."""
+    empty = {
+        "kind": "none",
+        "detail": "no journal",
+        "failed_checks": [],
+        "current_series_sha256": _hash_if_file(series_path),
+        "current_manifest_sha256": _hash_if_file(manifest_path),
+    }
+    payload = _read_journal(journal_dir)
+    if payload is None:
+        return empty
+    failed: list[str] = []
+    if payload.get("schema") != JOURNAL_SCHEMA:
+        failed.append("journal_schema")
+    backup_series = journal_dir / "backup_series.json"
+    backup_manifest = journal_dir / "backup_manifest.json"
+    backup_series_sha = _hash_if_file(backup_series)
+    backup_manifest_sha = _hash_if_file(backup_manifest)
+    expected_backup_series = payload.get("backup_series_sha256")
+    expected_backup_manifest = payload.get("backup_manifest_sha256")
+    pre_s = payload.get("pre_series_sha256")
+    pre_m = payload.get("pre_manifest_sha256")
+    plan_s = payload.get("planned_series_sha256")
+    plan_m = payload.get("planned_manifest_sha256")
+    if backup_series_sha is None:
+        failed.append("backup_series_missing")
+    elif expected_backup_series and backup_series_sha != expected_backup_series:
+        failed.append("backup_series_hash")
+    if backup_manifest_sha is None:
+        failed.append("backup_manifest_missing")
+    elif expected_backup_manifest and backup_manifest_sha != expected_backup_manifest:
+        failed.append("backup_manifest_hash")
+    current_s = _hash_if_file(series_path)
+    current_m = _hash_if_file(manifest_path)
+    if not pre_s or not pre_m or not plan_s or not plan_m:
+        failed.append("journal_hashes_incomplete")
+    result = {
+        "kind": "ambiguous",
+        "detail": str(payload.get("state") or "unknown"),
+        "failed_checks": failed,
+        "current_series_sha256": current_s,
+        "current_manifest_sha256": current_m,
+        "pre_series_sha256": pre_s,
+        "pre_manifest_sha256": pre_m,
+        "planned_series_sha256": plan_s,
+        "planned_manifest_sha256": plan_m,
+    }
+    if failed:
+        result["kind"] = "backup_invalid" if any(
+            item.startswith("backup_") for item in failed
+        ) else "ambiguous"
+        result["detail"] = ",".join(failed)
+        return result
+    if current_s == pre_s and current_m == pre_m:
+        result["kind"] = "stale_unpublished"
+        result["detail"] = "journal leftover; live files match pre-promote hashes"
+        return result
+    if current_s == plan_s and current_m == pre_m:
+        result["kind"] = "series_only"
+        result["detail"] = "series matches planned hash; manifest still pre-promote"
+        return result
+    if current_s == plan_s and current_m == plan_m:
+        result["kind"] = "complete"
+        result["detail"] = "series and manifest match planned hashes"
+        return result
+    result["kind"] = "ambiguous"
+    result["detail"] = (
+        f"live hashes match neither pre nor planned "
+        f"(series={current_s} manifest={current_m} state={payload.get('state')})"
+    )
+    return result
+
+
+def _require_backup(path: Path, expected_sha: str | None, label: str) -> None:
+    if not path.is_file():
+        raise ArchivePromoteError(f"rollback aborted: {label} missing")
+    actual = sha256_file(path)
+    if not expected_sha:
+        raise ArchivePromoteError(f"rollback aborted: {label} expected hash missing")
+    if actual != expected_sha:
+        raise ArchivePromoteError(
+            f"rollback aborted: {label} hash mismatch expected={expected_sha} actual={actual}"
+        )
+
+
 def _rollback(
     *,
     journal_dir: Path,
@@ -464,29 +660,25 @@ def _rollback(
     series_published: bool,
     replace_fn: ReplaceFn,
 ) -> None:
+    payload = _read_journal(journal_dir) or {}
     try:
+        expected_series = str(payload.get("backup_series_sha256") or payload.get("pre_series_sha256") or "")
+        expected_manifest = str(
+            payload.get("backup_manifest_sha256") or payload.get("pre_manifest_sha256") or ""
+        )
         if series_published:
+            _require_backup(backup_series, expected_series or None, "backup_series")
             replace_fn(backup_series, series_path)
-        if sha256_file(manifest_path) != sha256_file(backup_manifest):
+        if _hash_if_file(manifest_path) != expected_manifest:
+            _require_backup(backup_manifest, expected_manifest or None, "backup_manifest")
             replace_fn(backup_manifest, manifest_path)
+    except ArchivePromoteError:
+        raise
     except Exception as exc:
         raise ArchivePromoteError(
             f"rollback failed; promote journal remains: {exc}"
         ) from exc
     shutil.rmtree(journal_dir, ignore_errors=True)
-
-
-def _files_changed_from_journal(
-    journal_dir: Path, series_path: Path, manifest_path: Path
-) -> bool:
-    journal_file = journal_dir / "journal.json"
-    if not journal_file.is_file():
-        return False
-    try:
-        payload = load_json(journal_file)
-    except Exception:
-        return True
-    return str(payload.get("state") or "") in {"series_published", "committed"}
 
 
 def _write_report(path: Path, report: dict[str, Any]) -> None:

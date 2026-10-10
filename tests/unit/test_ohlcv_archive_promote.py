@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -355,5 +357,207 @@ def test_existing_journal_blocks_apply(tmp_path: Path) -> None:
     report = promote_archive_series(
         _req(tmp_path, files, apply=True, accept_json_decimal=True)
     )
-    assert report["failure_reason"] == "incomplete_promote_journal"
+    assert str(report["failure_reason"]).startswith("incomplete_promote_journal")
     assert files["btc"].read_bytes() == before
+
+
+def _crash_apply(tmp_path: Path, files: dict[str, Path], crash_at: str) -> subprocess.CompletedProcess[bytes]:
+    repo = Path(__file__).resolve().parents[2]
+    payload = (
+        "from pathlib import Path\n"
+        "from tradingbot.data.ohlcv.archive_promote import ArchivePromoteRequest, promote_archive_series\n"
+        f"req = ArchivePromoteRequest(root=Path(r'{tmp_path}'), symbol='BTCUSDT', timeframe='1h', "
+        f"archive_series_path=Path(r'{files['archive']}'), report_path=Path(r'{files['report']}'), "
+        "apply=True, accept_json_decimal=True)\n"
+        f"promote_archive_series(req, crash_at={crash_at!r})\n"
+    )
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(repo / "src") + os.pathsep + env.get("PYTHONPATH", "")
+    return subprocess.run(
+        [sys.executable, "-c", payload],
+        cwd=str(repo),
+        env=env,
+        capture_output=True,
+        check=False,
+    )
+
+
+def _resume(tmp_path: Path, files: dict[str, Path]):
+    return promote_archive_series(
+        _req(tmp_path, files, apply=True, accept_json_decimal=True)
+    )
+
+
+def test_crash_after_backed_up_blocks_and_keeps_originals(tmp_path: Path) -> None:
+    files = _setup(tmp_path)
+    before_btc = files["btc"].read_bytes()
+    before_man = files["manifest"].read_bytes()
+    crashed = _crash_apply(tmp_path, files, "after_backed_up")
+    assert crashed.returncode == 91
+    assert files["btc"].read_bytes() == before_btc
+    assert files["manifest"].read_bytes() == before_man
+    report = _resume(tmp_path, files)
+    assert report["status"] == "rejected"
+    assert "stale_unpublished" in str(report["failure_reason"])
+    assert files["btc"].read_bytes() == before_btc
+    assert any(
+        (tmp_path / "data" / "processed" / "ohlcv" / ".promote_journal").rglob("backup_series.json")
+    )
+
+
+def test_crash_after_series_replace_before_journal_state(tmp_path: Path) -> None:
+    files = _setup(tmp_path)
+    before_btc = files["btc"].read_bytes()
+    before_man = files["manifest"].read_bytes()
+    crashed = _crash_apply(tmp_path, files, "after_series_replace")
+    assert crashed.returncode == 91
+    assert files["btc"].read_bytes() != before_btc
+    assert files["manifest"].read_bytes() == before_man
+    report = _resume(tmp_path, files)
+    assert report["status"] == "rejected"
+    assert "series_only" in str(report["failure_reason"])
+    assert report["files_changed"] is True
+    assert files["manifest"].read_bytes() == before_man
+    assert any(
+        (tmp_path / "data" / "processed" / "ohlcv" / ".promote_journal").rglob("journal.json")
+    )
+
+
+def test_crash_after_series_published_journal(tmp_path: Path) -> None:
+    files = _setup(tmp_path)
+    before_man = files["manifest"].read_bytes()
+    crashed = _crash_apply(tmp_path, files, "after_series_published")
+    assert crashed.returncode == 91
+    report = _resume(tmp_path, files)
+    assert report["status"] == "rejected"
+    assert "series_only" in str(report["failure_reason"])
+    assert files["manifest"].read_bytes() == before_man
+    journal = json.loads(
+        next(
+            (tmp_path / "data" / "processed" / "ohlcv" / ".promote_journal").rglob("journal.json")
+        ).read_text(encoding="utf-8")
+    )
+    assert journal["state"] == "series_published"
+
+
+def test_crash_after_manifest_replace_before_committed(tmp_path: Path) -> None:
+    files = _setup(tmp_path)
+    crashed = _crash_apply(tmp_path, files, "after_manifest_replace")
+    assert crashed.returncode == 91
+    report = _resume(tmp_path, files)
+    assert report["status"] == "recovered_complete"
+    assert report["files_changed"] is False
+    candles = load_candles(files["btc"])
+    assert [c.timestamp for c in candles] == [0, HOUR, 2 * HOUR]
+    manifest = json.loads(files["manifest"].read_text(encoding="utf-8"))
+    btc = next(row for row in manifest["series"] if row["symbol"] == "BTC/USDT")
+    assert btc["sha256"] == sha256_file(files["btc"])
+    assert not any(
+        (tmp_path / "data" / "processed" / "ohlcv" / ".promote_journal").rglob("journal.json")
+    )
+
+
+def test_crash_after_committed_before_journal_delete(tmp_path: Path) -> None:
+    files = _setup(tmp_path)
+    crashed = _crash_apply(tmp_path, files, "after_committed")
+    assert crashed.returncode == 91
+    report = _resume(tmp_path, files)
+    assert report["status"] == "recovered_complete"
+    dataset = load_backtest_series(
+        Path("data/processed/ohlcv/manifest_1h.json"),
+        "BTC/USDT",
+        root=tmp_path,
+    )
+    assert dataset.bar_count == 3
+
+
+def test_loader_reject_rolls_back_bytes(tmp_path: Path) -> None:
+    files = _setup(tmp_path)
+    before_btc = files["btc"].read_bytes()
+    before_man = files["manifest"].read_bytes()
+
+    def boom_loader(*_args, **_kwargs):
+        raise ValueError("loader reject")
+
+    report = promote_archive_series(
+        _req(tmp_path, files, apply=True, accept_json_decimal=True),
+        loader_fn=boom_loader,
+    )
+    assert report["status"] == "failed"
+    assert files["btc"].read_bytes() == before_btc
+    assert files["manifest"].read_bytes() == before_man
+    assert not any(
+        (tmp_path / "data" / "processed" / "ohlcv" / ".promote_journal").rglob("journal.json")
+    )
+
+
+def test_missing_backup_aborts_rollback(tmp_path: Path) -> None:
+    files = _setup(tmp_path)
+
+    def flaky(src: Path, dst: Path) -> None:
+        if dst.name.startswith("manifest"):
+            for backup in (tmp_path / "data" / "processed" / "ohlcv" / ".promote_journal").rglob(
+                "backup_series.json"
+            ):
+                backup.unlink()
+            raise OSError("manifest replace failed")
+        os.replace(src, dst)
+
+    report = promote_archive_series(
+        _req(tmp_path, files, apply=True, accept_json_decimal=True),
+        replace_fn=flaky,
+    )
+    assert report["status"] == "failed"
+    assert "backup_series missing" in (report["failure_reason"] or "")
+    assert "promote_journal_present_after_failure" in report["warnings"]
+    assert any(
+        (tmp_path / "data" / "processed" / "ohlcv" / ".promote_journal").rglob("journal.json")
+    )
+
+
+def test_wrong_backup_hash_aborts_rollback(tmp_path: Path) -> None:
+    files = _setup(tmp_path)
+
+    def flaky(src: Path, dst: Path) -> None:
+        if dst.name.startswith("manifest"):
+            for backup in (tmp_path / "data" / "processed" / "ohlcv" / ".promote_journal").rglob(
+                "backup_series.json"
+            ):
+                backup.write_bytes(b"tampered")
+            raise OSError("manifest replace failed")
+        os.replace(src, dst)
+
+    report = promote_archive_series(
+        _req(tmp_path, files, apply=True, accept_json_decimal=True),
+        replace_fn=flaky,
+    )
+    assert report["status"] == "failed"
+    assert "backup_series hash mismatch" in (report["failure_reason"] or "")
+    assert any(
+        (tmp_path / "data" / "processed" / "ohlcv" / ".promote_journal").rglob("backup_series.json")
+    )
+
+
+def test_manifest_rollback_failure_keeps_journal(tmp_path: Path) -> None:
+    files = _setup(tmp_path)
+
+    def flaky(src: Path, dst: Path) -> None:
+        if src.name.startswith("backup_manifest"):
+            raise OSError("manifest rollback failed")
+        os.replace(src, dst)
+
+    def boom_loader(*_args, **_kwargs):
+        raise ValueError("loader reject")
+
+    report = promote_archive_series(
+        _req(tmp_path, files, apply=True, accept_json_decimal=True),
+        replace_fn=flaky,
+        loader_fn=boom_loader,
+    )
+    assert report["status"] == "failed"
+    assert "rollback failed" in (report["failure_reason"] or "") or "manifest rollback" in (
+        report["failure_reason"] or ""
+    )
+    assert any(
+        (tmp_path / "data" / "processed" / "ohlcv" / ".promote_journal").rglob("journal.json")
+    )
