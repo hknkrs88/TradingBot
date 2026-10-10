@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -312,16 +313,27 @@ def test_backtest_loader_accepts_promoted_dataset(tmp_path: Path) -> None:
     assert dataset.series.candles[0].timestamp == 0
 
 
+def _is_rollback_publish(src: Path) -> bool:
+    return ".rollback.tmp" in src.name
+
+
+def _backup_paths(tmp_path: Path) -> tuple[Path, Path]:
+    journal = _journal_json(tmp_path).parent
+    return journal / "backup_series.json", journal / "backup_manifest.json"
+
+
 def test_replace_failure_rolls_back_processed(tmp_path: Path) -> None:
     files = _setup(tmp_path)
     before_btc = files["btc"].read_bytes()
     before_man = files["manifest"].read_bytes()
-    calls = {"n": 0}
+    backups_during_restore: list[bool] = []
 
     def flaky(src: Path, dst: Path) -> None:
-        calls["n"] += 1
-        if dst.name.startswith("manifest"):
+        if dst.name.startswith("manifest") and not _is_rollback_publish(src):
             raise OSError("manifest replace failed")
+        if _is_rollback_publish(src):
+            series_b, man_b = _backup_paths(tmp_path)
+            backups_during_restore.append(series_b.is_file() and man_b.is_file())
         os.replace(src, dst)
 
     report = promote_archive_series(
@@ -331,6 +343,8 @@ def test_replace_failure_rolls_back_processed(tmp_path: Path) -> None:
     assert report["status"] == "failed"
     assert files["btc"].read_bytes() == before_btc
     assert files["manifest"].read_bytes() == before_man
+    assert backups_during_restore
+    assert all(backups_during_restore)
     journal = tmp_path / "data" / "processed" / "ohlcv" / ".promote_journal"
     assert not journal.exists() or not any(journal.rglob("journal.json"))
 
@@ -339,12 +353,12 @@ def test_rollback_failure_keeps_journal(tmp_path: Path) -> None:
     files = _setup(tmp_path)
     before_btc = files["btc"].read_bytes()
     before_man = files["manifest"].read_bytes()
-    calls = {"n": 0}
 
     def flaky(src: Path, dst: Path) -> None:
-        calls["n"] += 1
-        if calls["n"] >= 2:
-            raise OSError("boom")
+        if dst.name.startswith("manifest") and not _is_rollback_publish(src):
+            raise OSError("manifest publish failed")
+        if _is_rollback_publish(src):
+            raise OSError("series rollback replace failed")
         os.replace(src, dst)
 
     report = promote_archive_series(
@@ -354,13 +368,11 @@ def test_rollback_failure_keeps_journal(tmp_path: Path) -> None:
     assert report["status"] == "failed"
     assert "rollback failed" in (report["failure_reason"] or "")
     assert "promote_journal_present_after_failure" in report["warnings"]
-    # Series replace succeeded; series rollback then failed. Manifest never published.
     assert files["btc"].read_bytes() != before_btc
     assert files["manifest"].read_bytes() == before_man
     journal = _journal_json(tmp_path)
     payload = json.loads(journal.read_text(encoding="utf-8"))
-    backup_series = journal.parent / "backup_series.json"
-    backup_manifest = journal.parent / "backup_manifest.json"
+    backup_series, backup_manifest = _backup_paths(tmp_path)
     assert backup_series.is_file()
     assert backup_manifest.is_file()
     assert sha256_file(backup_series) == payload["backup_series_sha256"] == payload["pre_series_sha256"]
@@ -375,6 +387,8 @@ def test_rollback_failure_keeps_journal(tmp_path: Path) -> None:
     assert files["btc"].read_bytes() != before_btc
     assert files["manifest"].read_bytes() == before_man
     assert journal.is_file()
+    assert backup_series.is_file()
+    assert backup_manifest.is_file()
 
 
 def test_json_decimal_limitation_not_silent(tmp_path: Path) -> None:
@@ -566,20 +580,28 @@ def test_loader_reject_rolls_back_bytes(tmp_path: Path) -> None:
     files = _setup(tmp_path)
     before_btc = files["btc"].read_bytes()
     before_man = files["manifest"].read_bytes()
+    backups_during_restore: list[tuple[str, str]] = []
+
+    def tracking_replace(src: Path, dst: Path) -> None:
+        if _is_rollback_publish(src):
+            series_b, man_b = _backup_paths(tmp_path)
+            backups_during_restore.append((sha256_file(series_b), sha256_file(man_b)))
+        os.replace(src, dst)
 
     def boom_loader(*_args, **_kwargs):
         raise ValueError("loader reject")
 
     report = promote_archive_series(
         _req(tmp_path, files, apply=True, accept_json_decimal=True),
+        replace_fn=tracking_replace,
         loader_fn=boom_loader,
     )
     assert report["status"] == "failed"
     assert files["btc"].read_bytes() == before_btc
     assert files["manifest"].read_bytes() == before_man
-    assert not any(
-        (tmp_path / "data" / "processed" / "ohlcv" / ".promote_journal").rglob("journal.json")
-    )
+    assert backups_during_restore
+    assert len(set(backups_during_restore)) == 1
+    assert not any(_journal_root(tmp_path).rglob("journal.json"))
 
 
 def test_missing_backup_aborts_rollback(tmp_path: Path) -> None:
@@ -642,6 +664,9 @@ def test_wrong_backup_hash_aborts_rollback(tmp_path: Path) -> None:
     payload = json.loads(_journal_json(tmp_path).read_text(encoding="utf-8"))
     assert sha256_file(backup) != payload["backup_series_sha256"]
     assert sha256_file(files["btc"]) == payload["planned_series_sha256"]
+    backup_manifest = _journal_json(tmp_path).parent / "backup_manifest.json"
+    assert backup_manifest.is_file()
+    assert sha256_file(backup_manifest) == payload["backup_manifest_sha256"]
     resume = _resume(tmp_path, files)
     assert resume["status"] == "rejected"
     assert "backup_invalid" in str(resume["failure_reason"])
@@ -657,8 +682,8 @@ def test_manifest_rollback_failure_keeps_journal(tmp_path: Path) -> None:
     before_man = files["manifest"].read_bytes()
 
     def flaky(src: Path, dst: Path) -> None:
-        if src.name.startswith("backup_manifest"):
-            raise OSError("manifest rollback failed")
+        if _is_rollback_publish(src) and dst.name.startswith("manifest"):
+            raise OSError("manifest rollback replace failed")
         os.replace(src, dst)
 
     def boom_loader(*_args, **_kwargs):
@@ -673,25 +698,30 @@ def test_manifest_rollback_failure_keeps_journal(tmp_path: Path) -> None:
     assert "rollback failed" in (report["failure_reason"] or "") or "manifest rollback" in (
         report["failure_reason"] or ""
     )
-    # Series rolled back (os.replace consumes backup_series). Manifest rollback
-    # failed, so live files are mixed: original series + new manifest.
+    # Series restored from a copy; both backups remain. Manifest stays new.
     assert files["btc"].read_bytes() == before_btc
     assert files["manifest"].read_bytes() != before_man
     journal = _journal_json(tmp_path)
     payload = json.loads(journal.read_text(encoding="utf-8"))
+    backup_series, backup_manifest = _backup_paths(tmp_path)
+    assert backup_series.is_file()
+    assert backup_manifest.is_file()
+    assert sha256_file(backup_series) == payload["backup_series_sha256"] == payload["pre_series_sha256"]
+    assert sha256_file(backup_manifest) == payload["backup_manifest_sha256"]
     assert sha256_file(files["btc"]) == payload["pre_series_sha256"]
     assert sha256_file(files["manifest"]) == payload["planned_manifest_sha256"]
-    assert not (journal.parent / "backup_series.json").is_file()
-    assert (journal.parent / "backup_manifest.json").is_file()
     resume = _resume(tmp_path, files)
     assert resume["status"] == "rejected"
-    assert "backup_invalid" in str(resume["failure_reason"])
-    assert "backup_series_missing" in resume["journal_inspection"]["failed_checks"]
+    assert "ambiguous" in str(resume["failure_reason"])
     assert resume["recovery_required"] is True
     assert resume["automatic_repair"] is False
     assert files["btc"].read_bytes() == before_btc
     assert files["manifest"].read_bytes() != before_man
     assert journal.is_file()
+    assert backup_series.is_file()
+    assert backup_manifest.is_file()
+    assert sha256_file(backup_series) == payload["backup_series_sha256"]
+    assert sha256_file(backup_manifest) == payload["backup_manifest_sha256"]
 
 
 def _crash_backed_up(tmp_path: Path, files: dict[str, Path]) -> dict:
@@ -873,3 +903,43 @@ def test_cli_failed_apply_exits_nonzero(tmp_path: Path) -> None:
     result = _run_cli(tmp_path, files, ["--apply", "--accept-json-decimal"])
     assert result.returncode == 1
     assert b"status=rejected" in result.stdout
+
+
+def test_rollback_temp_copy_failure_preserves_backups(tmp_path: Path) -> None:
+    files = _setup(tmp_path)
+    before_btc = files["btc"].read_bytes()
+    before_man = files["manifest"].read_bytes()
+
+    def boom_copy(src: Path, dst: Path) -> None:
+        if str(dst).endswith(".rollback.tmp"):
+            raise OSError("rollback temp write failed")
+        shutil.copyfile(src, dst)
+
+    def flaky(src: Path, dst: Path) -> None:
+        if dst.name.startswith("manifest") and not _is_rollback_publish(src):
+            raise OSError("manifest publish failed")
+        os.replace(src, dst)
+
+    report = promote_archive_series(
+        _req(tmp_path, files, apply=True, accept_json_decimal=True),
+        replace_fn=flaky,
+        copy_fn=boom_copy,
+    )
+    assert report["status"] == "failed"
+    assert "rollback" in (report["failure_reason"] or "")
+    assert files["btc"].read_bytes() != before_btc
+    assert files["manifest"].read_bytes() == before_man
+    journal = _journal_json(tmp_path)
+    payload = json.loads(journal.read_text(encoding="utf-8"))
+    backup_series, backup_manifest = _backup_paths(tmp_path)
+    assert backup_series.is_file()
+    assert backup_manifest.is_file()
+    assert sha256_file(backup_series) == payload["backup_series_sha256"]
+    assert sha256_file(backup_manifest) == payload["backup_manifest_sha256"]
+    assert sha256_file(files["btc"]) == payload["planned_series_sha256"]
+    resume = _resume(tmp_path, files)
+    assert resume["status"] == "rejected"
+    assert "series_only" in str(resume["failure_reason"])
+    assert backup_series.is_file()
+    assert backup_manifest.is_file()
+    assert journal.is_file()

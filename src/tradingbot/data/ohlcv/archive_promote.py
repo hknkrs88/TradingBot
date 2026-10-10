@@ -45,6 +45,7 @@ _REQUIRED_JOURNAL_HASH_FIELDS = (
     "planned_manifest_sha256",
 )
 ReplaceFn = Callable[[Path, Path], None]
+CopyFn = Callable[[Path, Path], None]
 
 
 class ArchivePromoteError(ValueError):
@@ -75,11 +76,13 @@ def promote_archive_series(
     request: ArchivePromoteRequest,
     *,
     replace_fn: ReplaceFn | None = None,
+    copy_fn: CopyFn | None = None,
     crash_at: str | None = None,
     loader_fn: Callable[..., Any] | None = None,
 ) -> dict[str, Any]:
     """Dry-run by default. Writes processed files only when request.apply is true."""
     replacer = replace_fn or replace_file
+    copier = copy_fn or shutil.copyfile
     loader = loader_fn or load_backtest_series
     timeframe_ms(request.timeframe)
     _refuse_processed_report(request.report_path)
@@ -190,6 +193,7 @@ def promote_archive_series(
             manifest_path=manifest_path,
             journal_dir=journal_dir,
             replace_fn=replacer,
+            copy_fn=copier,
             crash_at=crash_at,
             loader_fn=loader,
         )
@@ -381,6 +385,7 @@ def _apply_transaction(
     manifest_path: Path,
     journal_dir: Path,
     replace_fn: ReplaceFn,
+    copy_fn: CopyFn,
     crash_at: str | None = None,
     loader_fn: Callable[..., Any] = load_backtest_series,
 ) -> None:
@@ -471,6 +476,7 @@ def _apply_transaction(
             backup_manifest=backup_manifest,
             series_published=series_published,
             replace_fn=replace_fn,
+            copy_fn=copy_fn,
         )
         raise
     shutil.rmtree(journal_dir, ignore_errors=True)
@@ -810,6 +816,46 @@ def _require_backup(path: Path, expected_sha: str | None, label: str) -> None:
         )
 
 
+def _rollback_temp(target: Path) -> Path:
+    return target.with_name(target.name + ".rollback.tmp")
+
+
+def _restore_from_backup(
+    backup: Path,
+    target: Path,
+    expected_sha: str,
+    label: str,
+    *,
+    copy_fn: CopyFn,
+    replace_fn: ReplaceFn,
+) -> None:
+    """Copy backup onto target via a temp file. The backup file itself is not moved."""
+    tmp = _rollback_temp(target)
+    try:
+        copy_fn(backup, tmp)
+        if not tmp.is_file() or sha256_file(tmp) != expected_sha:
+            raise ArchivePromoteError(
+                f"rollback aborted: {label} temp hash mismatch after copy"
+            )
+        replace_fn(tmp, target)
+    except ArchivePromoteError:
+        if tmp.exists():
+            tmp.unlink(missing_ok=True)
+        raise
+    except Exception as exc:
+        if tmp.exists():
+            tmp.unlink(missing_ok=True)
+        raise ArchivePromoteError(
+            f"rollback failed; promote journal remains: {exc}"
+        ) from exc
+    if tmp.exists():
+        tmp.unlink(missing_ok=True)
+    if sha256_file(target) != expected_sha:
+        raise ArchivePromoteError(
+            f"rollback aborted: {label} target hash mismatch after restore"
+        )
+
+
 def _rollback(
     *,
     journal_dir: Path,
@@ -819,19 +865,40 @@ def _rollback(
     backup_manifest: Path,
     series_published: bool,
     replace_fn: ReplaceFn,
+    copy_fn: CopyFn,
 ) -> None:
     payload = _read_journal(journal_dir) or {}
+    expected_series = _parse_sha256(payload.get("backup_series_sha256"))
+    expected_manifest = _parse_sha256(payload.get("backup_manifest_sha256"))
     try:
-        expected_series = _parse_sha256(payload.get("backup_series_sha256"))
-        expected_manifest = _parse_sha256(payload.get("backup_manifest_sha256"))
-        if series_published:
-            _require_backup(backup_series, expected_series, "backup_series")
-            replace_fn(backup_series, series_path)
-        if expected_manifest is None:
-            raise ArchivePromoteError("rollback aborted: backup_manifest expected hash missing")
+        _require_backup(backup_series, expected_series, "backup_series")
+        _require_backup(backup_manifest, expected_manifest, "backup_manifest")
+        if expected_series is None or expected_manifest is None:
+            raise ArchivePromoteError("rollback aborted: backup expected hash missing")
+        if series_published and _hash_if_file(series_path) != expected_series:
+            _restore_from_backup(
+                backup_series,
+                series_path,
+                expected_series,
+                "backup_series",
+                copy_fn=copy_fn,
+                replace_fn=replace_fn,
+            )
         if _hash_if_file(manifest_path) != expected_manifest:
-            _require_backup(backup_manifest, expected_manifest, "backup_manifest")
-            replace_fn(backup_manifest, manifest_path)
+            _restore_from_backup(
+                backup_manifest,
+                manifest_path,
+                expected_manifest,
+                "backup_manifest",
+                copy_fn=copy_fn,
+                replace_fn=replace_fn,
+            )
+        if series_published and sha256_file(series_path) != expected_series:
+            raise ArchivePromoteError("rollback aborted: series hash mismatch after restore")
+        if sha256_file(manifest_path) != expected_manifest:
+            raise ArchivePromoteError("rollback aborted: manifest hash mismatch after restore")
+        _require_backup(backup_series, expected_series, "backup_series")
+        _require_backup(backup_manifest, expected_manifest, "backup_manifest")
     except ArchivePromoteError:
         raise
     except Exception as exc:
