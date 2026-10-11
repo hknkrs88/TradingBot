@@ -2,11 +2,17 @@ from __future__ import annotations
 
 import logging
 from collections import defaultdict
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from tradingbot.data.binance_markets import skip_reason_for_market
+from tradingbot.data.coingecko import (
+    COINGECKO_PER_PAGE,
+    gecko_page_cache_path,
+    load_or_fetch_coingecko,
+)
 from tradingbot.data.io import atomic_write_json, sha256_file
 from tradingbot.data.match_policy import MatchPolicy
 from tradingbot.data.stables import StableDenylist
@@ -14,6 +20,7 @@ from tradingbot.data.stables import StableDenylist
 log = logging.getLogger("tradingbot.data.universe")
 
 UNIVERSE_LIMIT = 200
+MAX_GECKO_PAGES = 4
 
 
 class UniverseError(ValueError):
@@ -187,6 +194,96 @@ def match_universe(
     return matched, skipped
 
 
+def _gecko_row_rank_key(row: dict[str, Any]) -> tuple[int, int, str]:
+    rank = row.get("market_cap_rank")
+    gecko_id = str(row.get("id") or "")
+    if _valid_market_cap_rank(rank):
+        return (0, rank, gecko_id)
+    return (1, 0, gecko_id)
+
+
+def dedupe_gecko_rows_by_id(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep one row per CoinGecko id. Valid lower market_cap_rank wins."""
+    best: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    leftovers: list[dict[str, Any]] = []
+    for row in rows:
+        gecko_id = str(row.get("id") or "")
+        if not gecko_id:
+            leftovers.append(row)
+            continue
+        previous = best.get(gecko_id)
+        if previous is None:
+            best[gecko_id] = row
+            order.append(gecko_id)
+            continue
+        if _gecko_row_rank_key(row) < _gecko_row_rank_key(previous):
+            best[gecko_id] = row
+    return leftovers + [best[gecko_id] for gecko_id in order]
+
+
+def collapse_duplicate_binance_symbols(
+    assets: list[dict[str, Any]],
+    skipped: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Keep the best valid-rank row per binance_symbol. Record the rest."""
+    winners: dict[str, dict[str, Any]] = {}
+    losers: list[dict[str, Any]] = []
+    for item in assets:
+        symbol = str(item.get("binance_symbol") or "")
+        if not symbol:
+            losers.append(item)
+            continue
+        current = winners.get(symbol)
+        if current is None:
+            winners[symbol] = item
+            continue
+        if _rank_sort_key(item) < _rank_sort_key(current):
+            losers.append(current)
+            winners[symbol] = item
+        else:
+            losers.append(item)
+    for item in losers:
+        skipped.append(
+            {
+                "reason": "duplicate_binance_symbol",
+                "source": "match",
+                "ticker": str(item.get("base") or ""),
+                "id": str(item.get("coingecko_id") or ""),
+                "binance_symbol": str(item.get("binance_symbol") or ""),
+            }
+        )
+        log.info(
+            "skip_match reason=duplicate_binance_symbol ticker=%s id=%s symbol=%s",
+            item.get("base"),
+            item.get("coingecko_id"),
+            item.get("binance_symbol"),
+        )
+    unique = list(winners.values())
+    unique.sort(key=_rank_sort_key)
+    return unique
+
+
+def _eligible_count(assets: list[dict[str, Any]]) -> int:
+    return sum(1 for item in assets if _valid_market_cap_rank(item.get("market_cap_rank")))
+
+
+def _match_and_collapse(
+    gecko_rows: list[dict[str, Any]],
+    markets: list[dict[str, Any]],
+    stables: StableDenylist,
+    policy: MatchPolicy,
+    *,
+    generated_at: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    rows = dedupe_gecko_rows_by_id(gecko_rows)
+    assets, skipped = match_universe(
+        rows, markets, stables, policy, generated_at=generated_at
+    )
+    assets = collapse_duplicate_binance_symbols(assets, skipped)
+    return assets, skipped
+
+
 def select_top_universe(
     assets: list[dict[str, Any]],
     skipped: list[dict[str, Any]],
@@ -227,13 +324,20 @@ def write_universe_atomic(
     coingecko_raw: Path,
     binance_raw: Path,
     skipped: list[dict[str, Any]],
+    coingecko_page_files: tuple[Path, ...] = (),
 ) -> None:
+    source_hashes: dict[str, Any] = {
+        "coingecko_markets": sha256_file(coingecko_raw),
+        "binance_spot_markets": sha256_file(binance_raw),
+    }
+    page_hashes = {
+        file.name: sha256_file(file) for file in coingecko_page_files if file.is_file()
+    }
+    if page_hashes:
+        source_hashes["coingecko_market_pages"] = page_hashes
     payload = {
         "generated_at": generated_at,
-        "source_hashes": {
-            "coingecko_markets": sha256_file(coingecko_raw),
-            "binance_spot_markets": sha256_file(binance_raw),
-        },
+        "source_hashes": source_hashes,
         "counts": {
             "matched": len(assets),
             "skipped": len(skipped),
@@ -250,8 +354,55 @@ def build_universe_payload(
     policy: MatchPolicy,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str]:
     generated_at = datetime.now(UTC).replace(microsecond=0).isoformat()
-    assets, skipped = match_universe(
+    assets, skipped = _match_and_collapse(
         gecko_rows, markets, stables, policy, generated_at=generated_at
     )
     assets = select_top_universe(assets, skipped)
     return assets, skipped, generated_at
+
+
+def build_universe_from_gecko_pages(
+    gecko_dir: Path,
+    markets: list[dict[str, Any]],
+    stables: StableDenylist,
+    policy: MatchPolicy,
+    *,
+    refresh: bool = False,
+    fetch_page: Callable[[int], list[dict[str, Any]]] | None = None,
+    limit: int = UNIVERSE_LIMIT,
+    max_pages: int = MAX_GECKO_PAGES,
+    per_page: int = COINGECKO_PER_PAGE,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str, tuple[Path, ...]]:
+    """Fetch CoinGecko pages until ``limit`` eligible matches or ``max_pages``.
+
+    Does not write ``universe.json``. Empty pages stop fetching. Fewer than
+    ``limit`` valid ranks raises ``UniverseError``.
+    """
+    generated_at = datetime.now(UTC).replace(microsecond=0).isoformat()
+    collected: list[dict[str, Any]] = []
+    used_files: list[Path] = []
+    for page in range(1, max_pages + 1):
+        cache_path = gecko_page_cache_path(gecko_dir, page=page, per_page=per_page)
+        fetch_fn = None if fetch_page is None else (lambda current=page: fetch_page(current))
+        rows = load_or_fetch_coingecko(
+            cache_path,
+            refresh=refresh,
+            fetch_fn=fetch_fn,
+            page=page,
+            per_page=per_page,
+        )
+        if not rows:
+            break
+        if cache_path.is_file():
+            used_files.append(cache_path)
+        collected.extend(rows)
+        assets, _skipped = _match_and_collapse(
+            collected, markets, stables, policy, generated_at=generated_at
+        )
+        if _eligible_count(assets) >= limit:
+            break
+    assets, skipped = _match_and_collapse(
+        collected, markets, stables, policy, generated_at=generated_at
+    )
+    assets = select_top_universe(assets, skipped, limit=limit)
+    return assets, skipped, generated_at, tuple(used_files)

@@ -1,7 +1,7 @@
 """Build data/processed/universe.json from CoinGecko + live Binance public markets.
 
-Uses one CoinGecko markets request (or cache) and unauthenticated ccxt load_markets().
-Does not place orders or call private endpoints.
+Pages CoinGecko markets (250 per page) until 200 eligible matches or MAX_GECKO_PAGES.
+Uses unauthenticated ccxt load_markets(). Does not place orders or call private endpoints.
 """
 
 from __future__ import annotations
@@ -13,10 +13,10 @@ from collections import Counter
 from pathlib import Path
 
 from tradingbot.data.binance_markets import load_or_fetch_binance_markets
-from tradingbot.data.coingecko import load_or_fetch_coingecko
+from tradingbot.data.coingecko import COINGECKO_PER_PAGE, gecko_page_cache_path
 from tradingbot.data.match_policy import load_match_policy
 from tradingbot.data.stables import load_stables
-from tradingbot.data.universe import build_universe_payload, write_universe_atomic
+from tradingbot.data.universe import build_universe_from_gecko_pages, write_universe_atomic
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -33,7 +33,8 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     root: Path = args.root
-    gecko_path = root / "data" / "raw" / "coingecko_markets.json"
+    gecko_dir = root / "data" / "raw"
+    gecko_path = gecko_page_cache_path(gecko_dir, page=1, per_page=COINGECKO_PER_PAGE)
     binance_path = root / "data" / "raw" / "binance_spot_markets.json"
     universe_path = root / "data" / "processed" / "universe.json"
     stables_path = root / "configs" / "stables.toml"
@@ -42,18 +43,19 @@ def main(argv: list[str] | None = None) -> int:
     try:
         stables = load_stables(stables_path)
         policy = load_match_policy(match_path)
-        gecko_rows = load_or_fetch_coingecko(gecko_path, refresh=args.refresh)
         markets = load_or_fetch_binance_markets(binance_path, refresh=args.refresh)
-        assets, skipped, generated_at = build_universe_payload(
-            gecko_rows, markets, stables, policy
+        assets, skipped, generated_at, gecko_files = build_universe_from_gecko_pages(
+            gecko_dir, markets, stables, policy, refresh=args.refresh
         )
+        page1 = gecko_path if gecko_path.is_file() else gecko_files[0]
         write_universe_atomic(
             universe_path,
             assets,
             generated_at=generated_at,
-            coingecko_raw=gecko_path,
+            coingecko_raw=page1,
             binance_raw=binance_path,
             skipped=skipped,
+            coingecko_page_files=gecko_files,
         )
     except Exception:
         logging.exception("universe build failed; existing universe.json left unchanged")
