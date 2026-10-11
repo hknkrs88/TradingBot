@@ -244,3 +244,25 @@ def test_input_files_are_not_modified(tmp_path: Path) -> None:
     assert [item.symbol for item in result.selected] == [BTC]
     for path, payload in before.items():
         assert path.read_bytes() == payload
+
+
+def test_equal_scores_keep_universe_order(tmp_path: Path) -> None:
+    universe = _universe(tmp_path, [ETH, BTC, SOL])
+    shared = _series(50)
+    _dump(tmp_path, ETH, shared)
+    _dump(tmp_path, BTC, shared)
+    _dump(tmp_path, SOL, shared)
+    result = select_top_4h_candidates(universe_path=universe, root=tmp_path, now_ms=50 * TF)
+    assert [item.symbol for item in result.selected] == [ETH, BTC, SOL]
+    assert result.selected[0].score == result.selected[1].score == result.selected[2].score
+
+
+def test_corrupt_symbol_is_skipped_others_continue(tmp_path: Path) -> None:
+    universe = _universe(tmp_path, [ETH, BTC])
+    eth_path = _dump(tmp_path, ETH, _series(50))
+    _dump(tmp_path, BTC, _series(50, base=10.0))
+    eth_path.write_text("{not-json", encoding="utf-8")
+    result = select_top_4h_candidates(universe_path=universe, root=tmp_path, now_ms=50 * TF)
+    assert [item.symbol for item in result.selected] == [BTC]
+    assert ETH not in {item.symbol for item in result.selected}
+    assert result.rejected == ()
