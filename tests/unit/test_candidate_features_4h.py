@@ -467,4 +467,3 @@ def test_unexpected_runtime_error_is_not_recorded_as_rejection(
     )
     with pytest.raises(RuntimeError, match="programming bug"):
         candidate_features_4h(report, root=tmp_path)
-
