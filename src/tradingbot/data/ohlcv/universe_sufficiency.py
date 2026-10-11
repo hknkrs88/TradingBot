@@ -66,6 +66,13 @@ def assess_universe_4h(*, universe_path: Path, root: Path, now_ms: int) -> Unive
     )
 
 
+def scan_safe_for_selection(report: UniverseSufficiencyReport) -> bool:
+    """True unless any assessment was blocked by an unsafe promote journal."""
+    return all(
+        item.sufficiency.reason != "unsafe_promote_journal" for item in report.assessments
+    )
+
+
 def _result_from_cache_error(exc: InvalidCacheError, *, now_ms: int) -> SufficiencyResult:
     message = str(exc)
     for prefix, reason in _CACHE_ERROR_PREFIXES:
