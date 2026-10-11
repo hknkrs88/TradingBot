@@ -13,6 +13,24 @@ from tradingbot.data.stables import StableDenylist
 
 log = logging.getLogger("tradingbot.data.universe")
 
+UNIVERSE_LIMIT = 200
+
+
+class UniverseError(ValueError):
+    """Matched universe cannot be published."""
+
+
+def _valid_market_cap_rank(rank: Any) -> bool:
+    return type(rank) is int and rank > 0
+
+
+def _rank_sort_key(item: dict[str, Any]) -> tuple[int, int, str]:
+    rank = item.get("market_cap_rank")
+    symbol = str(item.get("binance_symbol") or "")
+    if not _valid_market_cap_rank(rank):
+        return (1, 0, symbol)
+    return (0, rank, symbol)
+
 
 def _index_markets_by_base(markets: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
     index: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -165,8 +183,40 @@ def match_universe(
         reason = market_reasons[0] if market_reasons else "no_binance_spot_usdt"
         _skip(skipped, reason=reason, ticker=ticker, gecko_id=gecko_id)
 
-    matched.sort(key=lambda item: (item["market_cap_rank"] is None, item["market_cap_rank"] or 0))
+    matched.sort(key=_rank_sort_key)
     return matched, skipped
+
+
+def select_top_universe(
+    assets: list[dict[str, Any]],
+    skipped: list[dict[str, Any]],
+    *,
+    limit: int = UNIVERSE_LIMIT,
+) -> list[dict[str, Any]]:
+    """Keep the lowest valid market_cap_rank rows, size exactly ``limit``.
+
+    Missing or non-positive ranks are not eligible. Fewer than ``limit``
+    eligible rows is an error; a short list is not returned.
+    """
+    eligible: list[dict[str, Any]] = []
+    for item in assets:
+        if not _valid_market_cap_rank(item.get("market_cap_rank")):
+            skipped.append(
+                {
+                    "reason": "missing_market_cap_rank",
+                    "source": "rank",
+                    "ticker": str(item.get("base") or ""),
+                    "id": str(item.get("coingecko_id") or ""),
+                }
+            )
+            continue
+        eligible.append(item)
+    eligible.sort(key=_rank_sort_key)
+    if len(eligible) < limit:
+        raise UniverseError(
+            f"eligible universe too small: {len(eligible)} < {limit}"
+        )
+    return eligible[:limit]
 
 
 def write_universe_atomic(
@@ -203,4 +253,5 @@ def build_universe_payload(
     assets, skipped = match_universe(
         gecko_rows, markets, stables, policy, generated_at=generated_at
     )
+    assets = select_top_universe(assets, skipped)
     return assets, skipped, generated_at

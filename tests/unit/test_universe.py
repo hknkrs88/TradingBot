@@ -11,7 +11,14 @@ from tradingbot.data.coingecko import load_or_fetch_coingecko, validate_coingeck
 from tradingbot.data.io import InvalidCacheError, atomic_write_json
 from tradingbot.data.match_policy import load_match_policy
 from tradingbot.data.stables import StableDenylist, load_stables
-from tradingbot.data.universe import match_universe, write_universe_atomic
+from tradingbot.data.universe import (
+    UNIVERSE_LIMIT,
+    UniverseError,
+    build_universe_payload,
+    match_universe,
+    select_top_universe,
+    write_universe_atomic,
+)
 
 STAMP = "2026-10-01T21:00:00+00:00"
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
@@ -309,3 +316,163 @@ def test_fetch_fn_not_used_when_cache_valid(tmp_path: Path) -> None:
         fetch_fn=lambda: (_ for _ in ()).throw(AssertionError("should use cache")),
     )
     assert rows[0]["id"] == "bitcoin"
+
+
+def _eligible_rows(count: int, *, rank_offset: int = 0) -> tuple[list[dict], list[dict]]:
+    gecko: list[dict] = []
+    markets: list[dict] = []
+    for index in range(count):
+        ticker = f"t{index:03d}"
+        gecko.append(_gecko(f"id-{ticker}", ticker, index + 1 + rank_offset, ticker))
+        markets.append(_spot(ticker.upper()))
+    return gecko, markets
+
+
+def test_select_top_universe_keeps_200_by_market_cap_rank() -> None:
+    gecko, markets = _eligible_rows(220)
+    gecko[0]["market_cap_rank"] = 500
+    gecko[-1]["market_cap_rank"] = 1
+    assets, skipped = match_universe(gecko, markets, _stables(), POLICY, generated_at=STAMP)
+    selected = select_top_universe(assets, skipped)
+    assert len(selected) == UNIVERSE_LIMIT
+    ranks = [item["market_cap_rank"] for item in selected]
+    assert ranks == sorted(ranks)
+    assert ranks[0] == 1
+    assert ranks[-1] == 200
+    assert selected[0]["binance_symbol"] == "T219/USDT"
+
+
+def test_build_universe_payload_requires_200_eligible() -> None:
+    gecko, markets = _eligible_rows(199)
+    with pytest.raises(UniverseError, match="eligible universe too small: 199 < 200"):
+        build_universe_payload(gecko, markets, _stables(), POLICY)
+
+
+def test_filters_still_exclude_stables_before_limit() -> None:
+    gecko, markets = _eligible_rows(199)
+    gecko.append(_gecko("tether", "usdt", 3))
+    markets.append(_spot("USDT"))
+    assets, skipped = match_universe(gecko, markets, _stables(), POLICY, generated_at=STAMP)
+    assert all(item["binance_symbol"] != "USDT/USDT" for item in assets)
+    assert any(item["reason"] in {"stable_base", "stable_coingecko_id"} for item in skipped)
+    with pytest.raises(UniverseError, match="too small"):
+        select_top_universe(assets, skipped)
+
+
+def test_inactive_market_does_not_count_toward_limit() -> None:
+    gecko, markets = _eligible_rows(199)
+    gecko.append(_gecko("idle-coin", "idle", 2))
+    markets.append(_spot("IDLE", active=False))
+    assets, skipped = match_universe(gecko, markets, _stables(), POLICY, generated_at=STAMP)
+    assert skipped[-1]["reason"] == "inactive_market"
+    with pytest.raises(UniverseError, match="too small"):
+        select_top_universe(assets, skipped)
+
+
+def test_rank_ties_are_deterministic() -> None:
+    gecko = [
+        _gecko("id-b", "tbb", 5),
+        _gecko("id-a", "taa", 5),
+        _gecko("id-c", "tcc", 4),
+    ]
+    markets = [_spot("TBB"), _spot("TAA"), _spot("TCC")]
+    first, _ = match_universe(gecko, markets, _stables(), POLICY, generated_at=STAMP)
+    second, _ = match_universe(list(reversed(gecko)), markets, _stables(), POLICY, generated_at=STAMP)
+    assert [item["binance_symbol"] for item in first] == ["TCC/USDT", "TAA/USDT", "TBB/USDT"]
+    assert [item["binance_symbol"] for item in first] == [item["binance_symbol"] for item in second]
+
+
+def test_missing_rank_does_not_fill_the_200() -> None:
+    gecko, markets = _eligible_rows(199)
+    gecko.append(_gecko("id-none", "tnone", 1))
+    gecko[-1]["market_cap_rank"] = None
+    markets.append(_spot("TNONE"))
+    assets, skipped = match_universe(gecko, markets, _stables(), POLICY, generated_at=STAMP)
+    with pytest.raises(UniverseError, match="too small"):
+        select_top_universe(assets, skipped)
+    assert any(item["reason"] == "missing_market_cap_rank" for item in skipped)
+
+
+def test_bool_float_and_non_positive_ranks_are_ineligible() -> None:
+    gecko, markets = _eligible_rows(200)
+    invalid_ranks = [True, False, 0, -1, 1.5, "1"]
+    for index, rank in enumerate(invalid_ranks):
+        ticker = f"x{index:03d}"
+        row = _gecko(f"id-{ticker}", ticker, 1)
+        row["market_cap_rank"] = rank
+        gecko.append(row)
+        markets.append(_spot(ticker.upper()))
+    assets, skipped, _generated_at = build_universe_payload(gecko, markets, _stables(), POLICY)
+    selected_symbols = {item["binance_symbol"] for item in assets}
+    assert len(assets) == UNIVERSE_LIMIT
+    assert all(f"X{index:03d}/USDT" not in selected_symbols for index in range(len(invalid_ranks)))
+    assert sum(item["reason"] == "missing_market_cap_rank" for item in skipped) == len(invalid_ranks)
+
+
+def test_short_universe_does_not_publish(tmp_path: Path) -> None:
+    gecko_path = tmp_path / "coingecko_markets.json"
+    binance_path = tmp_path / "binance_spot_markets.json"
+    universe_path = tmp_path / "universe.json"
+    gecko, markets = _eligible_rows(50)
+    atomic_write_json(gecko_path, gecko)
+    atomic_write_json(binance_path, markets)
+    universe_path.write_text("keep-me", encoding="utf-8")
+    with pytest.raises(UniverseError, match="too small"):
+        assets, skipped, generated_at = build_universe_payload(
+            gecko, markets, _stables(), POLICY
+        )
+        write_universe_atomic(
+            universe_path,
+            assets,
+            generated_at=generated_at,
+            coingecko_raw=gecko_path,
+            binance_raw=binance_path,
+            skipped=skipped,
+        )
+    assert universe_path.read_text(encoding="utf-8") == "keep-me"
+
+
+def test_short_universe_does_not_create_output_file(tmp_path: Path) -> None:
+    gecko_path = tmp_path / "coingecko_markets.json"
+    binance_path = tmp_path / "binance_spot_markets.json"
+    universe_path = tmp_path / "universe.json"
+    gecko, markets = _eligible_rows(50)
+    atomic_write_json(gecko_path, gecko)
+    atomic_write_json(binance_path, markets)
+    assert not universe_path.exists()
+    with pytest.raises(UniverseError, match="too small"):
+        assets, skipped, generated_at = build_universe_payload(
+            gecko, markets, _stables(), POLICY
+        )
+        write_universe_atomic(
+            universe_path,
+            assets,
+            generated_at=generated_at,
+            coingecko_raw=gecko_path,
+            binance_raw=binance_path,
+            skipped=skipped,
+        )
+    assert not universe_path.exists()
+
+
+def test_published_universe_is_exactly_200(tmp_path: Path) -> None:
+    gecko, markets = _eligible_rows(210)
+    gecko_path = tmp_path / "coingecko_markets.json"
+    binance_path = tmp_path / "binance_spot_markets.json"
+    universe_path = tmp_path / "universe.json"
+    atomic_write_json(gecko_path, gecko)
+    atomic_write_json(binance_path, markets)
+    assets, skipped, generated_at = build_universe_payload(gecko, markets, _stables(), POLICY)
+    write_universe_atomic(
+        universe_path,
+        assets,
+        generated_at=generated_at,
+        coingecko_raw=gecko_path,
+        binance_raw=binance_path,
+        skipped=skipped,
+    )
+    payload = json.loads(universe_path.read_text(encoding="utf-8"))
+    assert payload["counts"]["matched"] == UNIVERSE_LIMIT
+    assert len(payload["universe"]) == UNIVERSE_LIMIT
+    ranks = [row["market_cap_rank"] for row in payload["universe"]]
+    assert ranks == list(range(1, UNIVERSE_LIMIT + 1))
