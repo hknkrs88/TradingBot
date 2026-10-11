@@ -1,4 +1,16 @@
+from pathlib import Path
+
+import pytest
+
+from tradingbot.data.io import InvalidCacheError, atomic_write_json, sha256_file
+from tradingbot.data.ohlcv.archive_promote import (
+    JOURNAL_SCHEMA,
+    inspect_promote_journal,
+    promote_journal_dir,
+)
 from tradingbot.data.ohlcv.models import Candle
+from tradingbot.data.ohlcv.processed_sufficiency import assess_processed_4h
+from tradingbot.data.ohlcv.store import dump_candles, processed_path
 from tradingbot.data.ohlcv.sufficiency import (
     MIN_CLOSED_CANDLES,
     TIMEFRAME,
@@ -189,3 +201,217 @@ def test_empty_series_is_rejected_safely() -> None:
     assert result.last_closed_timestamp is None
     assert result.last_closed_age_ms is None
     assert result.has_gaps is False
+
+
+def _processed_4h(root: Path, candles: list[Candle], *, symbol: str = SYMBOL, timeframe: str = TIMEFRAME) -> Path:
+    path = processed_path(root / "data" / "processed" / "ohlcv", symbol, timeframe)
+    dump_candles(path, candles, symbol=symbol, timeframe=timeframe)
+    return path
+
+
+def test_processed_50_closed_with_identity_is_eligible(tmp_path: Path) -> None:
+    candles = _series(50)
+    _processed_4h(tmp_path, candles)
+    result = assess_processed_4h(SYMBOL, root=tmp_path, now_ms=50 * TF)
+    assert result.eligible is True
+    assert result.reason is None
+    assert result.identity_checked is True
+    assert result.closed_count == MIN_CLOSED_CANDLES
+
+
+def test_processed_49_closed_is_rejected(tmp_path: Path) -> None:
+    _processed_4h(tmp_path, _series(49))
+    result = assess_processed_4h(SYMBOL, root=tmp_path, now_ms=49 * TF)
+    assert result.eligible is False
+    assert result.reason == "too_few_closed_candles"
+
+
+def test_processed_source_symbol_mismatch(tmp_path: Path) -> None:
+    path = processed_path(tmp_path / "data" / "processed" / "ohlcv", SYMBOL, TIMEFRAME)
+    dump_candles(path, _series(50), symbol="ETH/USDT", timeframe=TIMEFRAME)
+    result = assess_processed_4h(SYMBOL, root=tmp_path, now_ms=50 * TF)
+    assert result.eligible is False
+    assert result.reason == "symbol_mismatch"
+
+
+def test_processed_source_timeframe_1h_mismatch(tmp_path: Path) -> None:
+    path = processed_path(tmp_path / "data" / "processed" / "ohlcv", SYMBOL, TIMEFRAME)
+    dump_candles(path, _series(50), symbol=SYMBOL, timeframe="1h")
+    result = assess_processed_4h(SYMBOL, root=tmp_path, now_ms=50 * TF)
+    assert result.eligible is False
+    assert result.reason == "timeframe_mismatch"
+
+
+def test_processed_missing_identity_is_not_eligible(tmp_path: Path) -> None:
+    path = processed_path(tmp_path / "data" / "processed" / "ohlcv", SYMBOL, TIMEFRAME)
+    atomic_write_json(
+        path,
+        {"candles": [item.to_dict() for item in _series(50)]},
+    )
+    result = assess_processed_4h(SYMBOL, root=tmp_path, now_ms=50 * TF)
+    assert result.eligible is False
+    assert result.reason == "missing_source_identity"
+    assert result.identity_checked is False
+
+
+def _write_processed_payload(root: Path, payload: dict) -> None:
+    path = processed_path(root / "data" / "processed" / "ohlcv", SYMBOL, TIMEFRAME)
+    atomic_write_json(path, payload)
+
+
+def test_processed_empty_source_symbol_is_missing_identity(tmp_path: Path) -> None:
+    _write_processed_payload(
+        tmp_path,
+        {
+            "symbol": "",
+            "timeframe": TIMEFRAME,
+            "candles": [item.to_dict() for item in _series(50)],
+        },
+    )
+    result = assess_processed_4h(SYMBOL, root=tmp_path, now_ms=50 * TF)
+    assert result.eligible is False
+    assert result.reason == "missing_source_identity"
+    assert result.identity_checked is False
+
+
+def test_processed_whitespace_source_symbol_is_mismatch(tmp_path: Path) -> None:
+    _write_processed_payload(
+        tmp_path,
+        {
+            "symbol": " ",
+            "timeframe": TIMEFRAME,
+            "candles": [item.to_dict() for item in _series(50)],
+        },
+    )
+    result = assess_processed_4h(SYMBOL, root=tmp_path, now_ms=50 * TF)
+    assert result.eligible is False
+    assert result.reason == "symbol_mismatch"
+    assert result.identity_checked is True
+
+
+def test_processed_non_string_source_symbol_is_missing_identity(tmp_path: Path) -> None:
+    _write_processed_payload(
+        tmp_path,
+        {
+            "symbol": 123,
+            "timeframe": TIMEFRAME,
+            "candles": [item.to_dict() for item in _series(50)],
+        },
+    )
+    result = assess_processed_4h(SYMBOL, root=tmp_path, now_ms=50 * TF)
+    assert result.eligible is False
+    assert result.reason == "missing_source_identity"
+    assert result.identity_checked is False
+
+
+def test_processed_empty_source_timeframe_is_missing_identity(tmp_path: Path) -> None:
+    _write_processed_payload(
+        tmp_path,
+        {
+            "symbol": SYMBOL,
+            "timeframe": "",
+            "candles": [item.to_dict() for item in _series(50)],
+        },
+    )
+    result = assess_processed_4h(SYMBOL, root=tmp_path, now_ms=50 * TF)
+    assert result.eligible is False
+    assert result.reason == "missing_source_identity"
+    assert result.identity_checked is False
+
+
+def test_processed_non_string_source_timeframe_is_missing_identity(tmp_path: Path) -> None:
+    _write_processed_payload(
+        tmp_path,
+        {
+            "symbol": SYMBOL,
+            "timeframe": 123,
+            "candles": [item.to_dict() for item in _series(50)],
+        },
+    )
+    result = assess_processed_4h(SYMBOL, root=tmp_path, now_ms=50 * TF)
+    assert result.eligible is False
+    assert result.reason == "missing_source_identity"
+    assert result.identity_checked is False
+
+
+def test_processed_missing_candles_field_raises(tmp_path: Path) -> None:
+    _write_processed_payload(tmp_path, {"symbol": SYMBOL, "timeframe": TIMEFRAME})
+    with pytest.raises(InvalidCacheError, match="ohlcv payload missing candles list"):
+        assess_processed_4h(SYMBOL, root=tmp_path, now_ms=50 * TF)
+
+
+def test_processed_candles_not_a_list_raises(tmp_path: Path) -> None:
+    _write_processed_payload(
+        tmp_path,
+        {"symbol": SYMBOL, "timeframe": TIMEFRAME, "candles": {"not": "a list"}},
+    )
+    with pytest.raises(InvalidCacheError, match="ohlcv payload missing candles list"):
+        assess_processed_4h(SYMBOL, root=tmp_path, now_ms=50 * TF)
+
+
+def test_processed_series_only_journal_raises(tmp_path: Path) -> None:
+    series_path = _processed_4h(tmp_path, _series(50))
+    manifest_path = tmp_path / "data" / "processed" / "ohlcv" / "manifest_4h.json"
+    atomic_write_json(manifest_path, {"schema": "ohlcv_dataset_manifest/v1", "timeframe": "4h"})
+    pre_series = sha256_file(series_path)
+    pre_manifest = sha256_file(manifest_path)
+    backup_series = series_path.read_bytes()
+    backup_manifest = manifest_path.read_bytes()
+    dump_candles(series_path, _series(51), symbol=SYMBOL, timeframe=TIMEFRAME)
+    journal_dir = promote_journal_dir(tmp_path, SYMBOL, TIMEFRAME)
+    journal_dir.mkdir(parents=True, exist_ok=True)
+    (journal_dir / "backup_series.json").write_bytes(backup_series)
+    (journal_dir / "backup_manifest.json").write_bytes(backup_manifest)
+    atomic_write_json(
+        journal_dir / "journal.json",
+        {
+            "schema": JOURNAL_SCHEMA,
+            "state": "test",
+            "pre_series_sha256": pre_series,
+            "pre_manifest_sha256": pre_manifest,
+            "backup_series_sha256": sha256_file(journal_dir / "backup_series.json"),
+            "backup_manifest_sha256": sha256_file(journal_dir / "backup_manifest.json"),
+            "planned_series_sha256": sha256_file(series_path),
+            "planned_manifest_sha256": "ab" * 32,
+        },
+    )
+    assert inspect_promote_journal(tmp_path, SYMBOL, TIMEFRAME)["kind"] == "series_only"
+    with pytest.raises(InvalidCacheError, match="unsafe_promote_journal:series_only:"):
+        assess_processed_4h(SYMBOL, root=tmp_path, now_ms=51 * TF)
+
+
+def test_processed_gaps_are_reported_without_rejecting(tmp_path: Path) -> None:
+    candles = _series(49) + [_c(50)]
+    _processed_4h(tmp_path, candles)
+    result = assess_processed_4h(SYMBOL, root=tmp_path, now_ms=51 * TF)
+    assert result.eligible is True
+    assert result.has_gaps is True
+    assert result.reason is None
+
+
+def test_processed_json_bytes_are_unchanged(tmp_path: Path) -> None:
+    path = _processed_4h(tmp_path, _series(50))
+    before = path.read_bytes()
+    assess_processed_4h(SYMBOL, root=tmp_path, now_ms=50 * TF)
+    assert path.read_bytes() == before
+
+
+def test_processed_caller_candle_list_is_not_mutated(tmp_path: Path) -> None:
+    candles = _series(50)
+    original = list(candles)
+    _processed_4h(tmp_path, candles)
+    assess_processed_4h(SYMBOL, root=tmp_path, now_ms=50 * TF)
+    assert candles == original
+
+
+def test_processed_missing_file_raises(tmp_path: Path) -> None:
+    with pytest.raises(InvalidCacheError, match="missing cache"):
+        assess_processed_4h(SYMBOL, root=tmp_path, now_ms=50 * TF)
+
+
+def test_processed_corrupt_json_raises(tmp_path: Path) -> None:
+    path = processed_path(tmp_path / "data" / "processed" / "ohlcv", SYMBOL, TIMEFRAME)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("{not-json", encoding="utf-8")
+    with pytest.raises(InvalidCacheError, match="corrupt cache"):
+        assess_processed_4h(SYMBOL, root=tmp_path, now_ms=50 * TF)
