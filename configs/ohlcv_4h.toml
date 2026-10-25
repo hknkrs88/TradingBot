@@ -1,0 +1,8 @@
+provider = "binance_public"
+timeframes = ["4h"]
+candle_limit = 1000
+raw_dir = "data/raw/ohlcv"
+processed_dir = "data/processed/ohlcv"
+retry_max = 3
+backoff_seconds = 1.0
+drop_incomplete = true
