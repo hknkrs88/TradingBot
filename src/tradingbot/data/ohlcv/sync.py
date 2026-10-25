@@ -16,6 +16,7 @@ from tradingbot.data.ohlcv.binance_ohlcv import (
 from tradingbot.data.ohlcv.manifest import write_ohlcv_manifests
 from tradingbot.data.ohlcv.models import Candle
 from tradingbot.data.ohlcv.protocol import OHLCVProvider
+from tradingbot.data.ohlcv.quality import UnalignedTimestampError, require_aligned_4h
 from tradingbot.data.ohlcv.retry import call_with_retry
 from tradingbot.data.ohlcv.store import (
     dump_candles,
@@ -187,10 +188,10 @@ def sync_symbol_timeframe(
     processed_file = processed_path(processed_root, symbol, timeframe)
 
     existing: list[Candle] = []
-    try:
+    if processed_file.is_file():
         existing = load_candles(processed_file)
-    except InvalidCacheError:
-        existing = []
+    if timeframe == "4h":
+        require_aligned_4h(symbol, existing)
 
     last_closed = last_closed_timestamp(existing, timeframe, now_ms)
     if is_caught_up(last_closed, timeframe, now_ms):
@@ -227,6 +228,8 @@ def sync_symbol_timeframe(
         sleep_fn=sleep_fn,
     )
     fetched = _unique_keep_first(fetched)
+    if timeframe == "4h":
+        require_aligned_4h(symbol, fetched)
     dump_candles(
         raw_file,
         fetched,
@@ -272,6 +275,7 @@ def sync_ohlcv(
     report = _empty_report()
     failed_symbols: set[str] = set()
     ok_symbols: set[str] = set()
+    alignment_error: UnalignedTimestampError | None = None
 
     for symbol in symbols:
         symbol_failed = False
@@ -294,6 +298,31 @@ def sync_ohlcv(
                         "symbol": symbol,
                         "timeframe": timeframe,
                         "reason": "unsupported_timeframe",
+                        "message": str(exc),
+                    }
+                )
+                report["series"].append(
+                    {
+                        "symbol": symbol,
+                        "timeframe": timeframe,
+                        "reason": "failed",
+                        "range_start": None,
+                        "range_end": None,
+                        "issues": [],
+                    }
+                )
+                continue
+            except UnalignedTimestampError as exc:
+                symbol_failed = True
+                if alignment_error is None:
+                    alignment_error = exc
+                log.warning("ohlcv sync failed symbol=%s tf=%s error=%s", symbol, timeframe, exc)
+                report["errors"].append(
+                    {
+                        "symbol": exc.symbol,
+                        "timeframe": exc.timeframe,
+                        "reason": type(exc).__name__,
+                        "timestamp": exc.timestamp,
                         "message": str(exc),
                     }
                 )
@@ -353,7 +382,12 @@ def sync_ohlcv(
 
     report["symbols_ok"] = len(ok_symbols)
     report["symbols_failed"] = len(failed_symbols)
-    atomic_write_json(processed_root / "sync_report.json", report)
+    try:
+        atomic_write_json(processed_root / "sync_report.json", report)
+    except Exception as write_exc:
+        if alignment_error is not None:
+            raise alignment_error from write_exc
+        raise
     write_ohlcv_manifests(
         universe_path=universe_path,
         processed_root=processed_root,

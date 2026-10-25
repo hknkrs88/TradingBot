@@ -11,6 +11,28 @@ def is_incomplete(candle: Candle, tf_ms: int, now_ms: int) -> bool:
     return candle.timestamp + tf_ms > now_ms
 
 
+class UnalignedTimestampError(Exception):
+    def __init__(self, *, symbol: str, timeframe: str, timestamp: int) -> None:
+        self.symbol = symbol
+        self.timeframe = timeframe
+        self.timestamp = timestamp
+        super().__init__(
+            f"unaligned_timestamp symbol={symbol} timeframe={timeframe} timestamp={timestamp}"
+        )
+
+
+def require_aligned_4h(symbol: str, candles: list[Candle]) -> None:
+    """Reject 4h timestamps that are not on the UTC 4h grid. Does not rewrite data."""
+    tf_ms = timeframe_ms("4h")
+    for candle in candles:
+        if candle.timestamp % tf_ms != 0:
+            raise UnalignedTimestampError(
+                symbol=symbol,
+                timeframe="4h",
+                timestamp=candle.timestamp,
+            )
+
+
 def candle_issue(candle: Candle, *, now_ms: int) -> str | None:
     if candle.timestamp > now_ms:
         return "future_timestamp"

@@ -1,10 +1,13 @@
+import importlib.util
 import json
 from pathlib import Path
 
 import ccxt
+import pytest
 
-from tradingbot.data.io import atomic_write_json
+from tradingbot.data.io import atomic_write_json, sha256_file
 from tradingbot.data.ohlcv.models import Candle
+from tradingbot.data.ohlcv.quality import UnalignedTimestampError
 from tradingbot.data.ohlcv.store import dump_candles, load_candles
 from tradingbot.data.ohlcv.sync import OHLCVConfig, sync_ohlcv
 
@@ -318,4 +321,305 @@ def test_cache_hit_deduplicates_timestamps(tmp_path: Path) -> None:
     assert stamps == sorted(stamps)
     assert len(stamps) == len(set(stamps))
     assert any(item["reason"] == "duplicate_timestamp" for item in report["series"][0]["issues"])
+
+
+FOUR_H = 14_400_000
+
+
+def test_corrupt_4h_cache_stops_without_provider_or_overwrite(tmp_path: Path) -> None:
+    universe = _btc_universe(tmp_path)
+    path = tmp_path / "processed" / "BTCUSDT" / "4h.json"
+    dump_candles(path, [_c(0), _c(FOUR_H)], symbol="BTC/USDT", timeframe="4h")
+    path.write_bytes(b"{not json")
+    before = path.read_bytes()
+    provider = FakeProvider({("BTC/USDT", "4h"): [_c(2 * FOUR_H)]})
+    report = sync_ohlcv(
+        universe_path=universe,
+        config=_config(tmp_path, timeframes=("4h",)),
+        provider=provider,
+        root=tmp_path,
+        now_ms=4 * FOUR_H,
+        sleep_fn=lambda _d: None,
+    )
+    assert provider.calls == []
+    assert path.read_bytes() == before
+    assert not (tmp_path / "raw" / "binance_public" / "BTCUSDT" / "4h.json").exists()
+    assert report["symbols_failed"] == 1
+    assert report["symbols_ok"] == 0
+    assert report["errors"][0]["symbol"] == "BTC/USDT"
+    assert report["errors"][0]["timeframe"] == "4h"
+    assert report["errors"][0]["reason"] == "InvalidCacheError"
+    assert report["series"][0]["reason"] == "failed"
+
+
+def test_missing_processed_file_still_fetches(tmp_path: Path) -> None:
+    universe = _btc_universe(tmp_path)
+    path = tmp_path / "processed" / "BTCUSDT" / "4h.json"
+    assert not path.exists()
+    provider = FakeProvider({("BTC/USDT", "4h"): [_c(0)]})
+    report = sync_ohlcv(
+        universe_path=universe,
+        config=_config(tmp_path, timeframes=("4h",)),
+        provider=provider,
+        root=tmp_path,
+        now_ms=2 * FOUR_H,
+        sleep_fn=lambda _d: None,
+    )
+    assert provider.calls[0]["since"] is None
+    assert report["symbols_ok"] == 1
+    assert report["symbols_failed"] == 0
+    assert [c.timestamp for c in load_candles(path)] == [0]
+
+
+def _sync_script():
+    path = Path(__file__).resolve().parents[2] / "scripts" / "sync_ohlcv.py"
+    spec = importlib.util.spec_from_file_location("sync_ohlcv_cli", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _write_ohlcv_config(tmp_path: Path) -> Path:
+    path = tmp_path / "ohlcv.toml"
+    path.write_text(
+        "\n".join(
+            [
+                'provider = "binance_public"',
+                'timeframes = ["1h"]',
+                "candle_limit = 10",
+                'raw_dir = "data/raw/ohlcv"',
+                'processed_dir = "data/processed/ohlcv"',
+                "retry_max = 0",
+                "backoff_seconds = 0",
+                "drop_incomplete = true",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+class _CliProvider:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def fetch_ohlcv(self, symbol, timeframe, *, since=None, limit=None):
+        self.calls.append(symbol)
+        return [_c(0)]
+
+
+def test_cli_without_universe_uses_default_file(tmp_path: Path, monkeypatch) -> None:
+    live = tmp_path / "data" / "processed" / "universe.json"
+    atomic_write_json(live, {"universe": [{"binance_symbol": "BTC/USDT"}]})
+    other = tmp_path / "data" / "processed" / "universe_validation.json"
+    atomic_write_json(other, {"universe": [{"binance_symbol": "ETH/USDT"}]})
+    config = _write_ohlcv_config(tmp_path)
+    provider = _CliProvider()
+    module = _sync_script()
+    monkeypatch.setattr(module, "BinancePublicOHLCVProvider", lambda: provider)
+    code = module.main(["--root", str(tmp_path), "--config", str(config)])
+    assert code == 0
+    assert provider.calls == ["BTC/USDT"]
+    manifest = json.loads(
+        (tmp_path / "data" / "processed" / "ohlcv" / "manifest_1h.json").read_text(encoding="utf-8")
+    )
+    assert manifest["universe"]["path"] == "data/processed/universe.json"
+    assert manifest["universe"]["sha256"] == sha256_file(live)
+
+
+def test_cli_universe_flag_syncs_only_that_file(tmp_path: Path, monkeypatch) -> None:
+    live = tmp_path / "data" / "processed" / "universe.json"
+    atomic_write_json(
+        live,
+        {"universe": [{"binance_symbol": "BTC/USDT"}, {"binance_symbol": "ETH/USDT"}]},
+    )
+    before = live.read_bytes()
+    validation = tmp_path / "data" / "processed" / "universe_validation.json"
+    atomic_write_json(validation, {"universe": [{"binance_symbol": "ETH/USDT"}]})
+    config = _write_ohlcv_config(tmp_path)
+    provider = _CliProvider()
+    module = _sync_script()
+    monkeypatch.setattr(module, "BinancePublicOHLCVProvider", lambda: provider)
+    code = module.main(
+        [
+            "--root",
+            str(tmp_path),
+            "--config",
+            str(config),
+            "--universe",
+            "data/processed/universe_validation.json",
+        ]
+    )
+    assert code == 0
+    assert provider.calls == ["ETH/USDT"]
+    assert live.read_bytes() == before
+    manifest = json.loads(
+        (tmp_path / "data" / "processed" / "ohlcv" / "manifest_1h.json").read_text(encoding="utf-8")
+    )
+    assert manifest["universe"]["path"] == "data/processed/universe_validation.json"
+    assert manifest["universe"]["sha256"] == sha256_file(validation)
+    assert manifest["universe"]["symbols"] == ["ETH/USDT"]
+
+
+def test_4h_open_candle_not_written_exact_close_is(tmp_path: Path) -> None:
+    universe = _btc_universe(tmp_path)
+    now = 2 * FOUR_H
+    boundary = Candle(timestamp=FOUR_H, open=1, high=2, low=0.5, close=1.5, volume=10)
+    still_open = Candle(timestamp=2 * FOUR_H, open=4, high=5, low=3, close=4.5, volume=12)
+    provider = FakeProvider({("BTC/USDT", "4h"): [_c(0), boundary, still_open]})
+    report = sync_ohlcv(
+        universe_path=universe,
+        config=_config(tmp_path, timeframes=("4h",)),
+        provider=provider,
+        root=tmp_path,
+        now_ms=now,
+        sleep_fn=lambda _d: None,
+    )
+    saved = load_candles(tmp_path / "processed" / "BTCUSDT" / "4h.json")
+    assert saved == [_c(0), boundary]
+    assert any(
+        item["reason"] == "incomplete_candle" and item["timestamp"] == still_open.timestamp
+        for item in report["series"][0]["issues"]
+    )
+
+
+def test_4h_conflicting_ohlc_does_not_overwrite_existing(tmp_path: Path) -> None:
+    universe = _btc_universe(tmp_path)
+    existing = Candle(timestamp=0, open=1, high=2, low=0.5, close=1.5, volume=10)
+    path = tmp_path / "processed" / "BTCUSDT" / "4h.json"
+    dump_candles(path, [existing], symbol="BTC/USDT", timeframe="4h")
+    incoming = Candle(timestamp=0, open=10, high=20, low=5, close=15, volume=99)
+    added = Candle(timestamp=FOUR_H, open=3, high=4, low=2, close=3.5, volume=8)
+    report = sync_ohlcv(
+        universe_path=universe,
+        config=_config(tmp_path, timeframes=("4h",)),
+        provider=FakeProvider({("BTC/USDT", "4h"): [incoming, added]}),
+        root=tmp_path,
+        now_ms=3 * FOUR_H,
+        sleep_fn=lambda _d: None,
+    )
+    assert load_candles(path) == [existing, added]
+    assert {"reason": "duplicate_timestamp", "timestamp": 0} in report["series"][0]["issues"]
+
+
+def test_4h_missing_candles_reported_not_filled(tmp_path: Path) -> None:
+    universe = _btc_universe(tmp_path)
+    report = sync_ohlcv(
+        universe_path=universe,
+        config=_config(tmp_path, timeframes=("4h",)),
+        provider=FakeProvider({("BTC/USDT", "4h"): [_c(0), _c(2 * FOUR_H)]}),
+        root=tmp_path,
+        now_ms=4 * FOUR_H,
+        sleep_fn=lambda _d: None,
+    )
+    saved = load_candles(tmp_path / "processed" / "BTCUSDT" / "4h.json")
+    assert [c.timestamp for c in saved] == [0, 2 * FOUR_H]
+    assert report["symbols_ok"] == 1
+    missing = [
+        item for item in report["series"][0]["issues"] if item["reason"] == "missing_candles"
+    ]
+    assert missing == [{"reason": "missing_candles", "timestamp": FOUR_H}]
+
+
+def test_4h_duplicate_timestamp_in_file_drops_both(tmp_path: Path) -> None:
+    universe = _btc_universe(tmp_path)
+    first = Candle(timestamp=0, open=1, high=2, low=0.5, close=1.5, volume=10)
+    second = Candle(timestamp=0, open=1.1, high=2.2, low=0.4, close=1.8, volume=11)
+    kept = Candle(timestamp=FOUR_H, open=3, high=4, low=2, close=3.5, volume=8)
+    path = tmp_path / "processed" / "BTCUSDT" / "4h.json"
+    dump_candles(path, [first, second, kept], symbol="BTC/USDT", timeframe="4h")
+    provider = FakeProvider({})
+    report = sync_ohlcv(
+        universe_path=universe,
+        config=_config(tmp_path, timeframes=("4h",)),
+        provider=provider,
+        root=tmp_path,
+        now_ms=2 * FOUR_H + 1,
+        sleep_fn=lambda _d: None,
+    )
+    assert provider.calls == []
+    assert load_candles(path) == [kept]
+    assert {"reason": "duplicate_timestamp", "timestamp": 0} in report["series"][0]["issues"]
+
+
+def test_unaligned_4h_cache_stops_before_provider_or_write(tmp_path: Path) -> None:
+    universe = _btc_universe(tmp_path)
+    path = tmp_path / "processed" / "BTCUSDT" / "4h.json"
+    dump_candles(
+        path,
+        [Candle(timestamp=1_800_000, open=1, high=2, low=0.5, close=1.5, volume=10)],
+        symbol="BTC/USDT",
+        timeframe="4h",
+    )
+    before = path.read_bytes()
+    provider = FakeProvider({("BTC/USDT", "4h"): [_c(0)]})
+    with pytest.raises(UnalignedTimestampError) as exc_info:
+        sync_ohlcv(
+            universe_path=universe,
+            config=_config(tmp_path, timeframes=("4h",)),
+            provider=provider,
+            root=tmp_path,
+            now_ms=4 * FOUR_H,
+            sleep_fn=lambda _d: None,
+        )
+    error = exc_info.value
+    assert error.symbol == "BTC/USDT"
+    assert error.timeframe == "4h"
+    assert error.timestamp == 1_800_000
+    assert provider.calls == []
+    assert path.read_bytes() == before
+    assert not (tmp_path / "raw" / "binance_public" / "BTCUSDT" / "4h.json").exists()
+    assert not (tmp_path / "processed" / "manifest_4h.json").exists()
+    saved = json.loads((tmp_path / "processed" / "sync_report.json").read_text(encoding="utf-8"))
+    assert saved["symbols_failed"] == 1
+    assert saved["symbols_ok"] == 0
+    assert saved["errors"][0] == {
+        "symbol": "BTC/USDT",
+        "timeframe": "4h",
+        "reason": "UnalignedTimestampError",
+        "timestamp": 1_800_000,
+        "message": str(error),
+    }
+    assert saved["series"][0]["reason"] == "failed"
+
+
+def test_sync_report_write_failure_keeps_alignment_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    universe = _btc_universe(tmp_path)
+    path = tmp_path / "processed" / "BTCUSDT" / "4h.json"
+    dump_candles(
+        path,
+        [Candle(timestamp=1_800_000, open=1, high=2, low=0.5, close=1.5, volume=10)],
+        symbol="BTC/USDT",
+        timeframe="4h",
+    )
+    before = path.read_bytes()
+
+    def fail_report(report_path: Path, payload: object) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr("tradingbot.data.ohlcv.sync.atomic_write_json", fail_report)
+    provider = FakeProvider({("BTC/USDT", "4h"): [_c(0)]})
+    with pytest.raises(UnalignedTimestampError) as exc_info:
+        sync_ohlcv(
+            universe_path=universe,
+            config=_config(tmp_path, timeframes=("4h",)),
+            provider=provider,
+            root=tmp_path,
+            now_ms=4 * FOUR_H,
+            sleep_fn=lambda _d: None,
+        )
+    error = exc_info.value
+    assert error.symbol == "BTC/USDT"
+    assert error.timeframe == "4h"
+    assert error.timestamp == 1_800_000
+    assert isinstance(error.__cause__, OSError)
+    assert "disk full" in str(error.__cause__)
+    assert provider.calls == []
+    assert path.read_bytes() == before
+    assert not (tmp_path / "processed" / "sync_report.json").exists()
+    assert not (tmp_path / "processed" / "manifest_4h.json").exists()
 

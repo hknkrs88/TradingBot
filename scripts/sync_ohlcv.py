@@ -19,6 +19,21 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Sync public OHLCV for the coin universe")
     parser.add_argument("--root", type=Path, default=ROOT)
     parser.add_argument("--config", type=Path, default=None)
+    parser.add_argument(
+        "--universe",
+        type=Path,
+        default=None,
+        help="Universe JSON to sync. Defaults to the paper settings universe path.",
+    )
+    parser.add_argument(
+        "--require-4h-consistency",
+        action="store_true",
+        help=(
+            "Validation-only. Before syncing a 4h config, require the selected "
+            "universe to match manifest_4h.json, or allow a fully empty dataset. "
+            "Does not change the default sync."
+        ),
+    )
     args = parser.parse_args(argv)
 
     logging.basicConfig(
@@ -30,8 +45,40 @@ def main(argv: list[str] | None = None) -> int:
     settings = load_settings(root / "configs" / "paper.toml")
     ohlcv_path = args.config or (root / settings.ohlcv_config_path)
     config = load_ohlcv_config(ohlcv_path)
-    universe_path = root / settings.universe_path
+    if args.universe is None:
+        universe_path = root / settings.universe_path
+    elif args.universe.is_absolute():
+        universe_path = args.universe
+    else:
+        universe_path = root / args.universe
     now_ms = int(time.time() * 1000)
+    if args.require_4h_consistency:
+        if config.timeframes != ("4h",):
+            print(
+                "error: --require-4h-consistency requires a config whose only timeframe is 4h",
+                file=sys.stderr,
+            )
+            return 1
+        from tradingbot.data.ohlcv.quality import UnalignedTimestampError
+        from tradingbot.data.ohlcv.validation_4h import (
+            ValidationDatasetError,
+            inspect_4h_validation_dataset,
+        )
+
+        try:
+            inspect_4h_validation_dataset(
+                root=root,
+                universe_path=universe_path,
+                processed_root=root / config.processed_dir,
+                now_ms=now_ms,
+                drop_incomplete=config.drop_incomplete,
+            )
+        except ValidationDatasetError as exc:
+            print(f"error: {exc.reason}", file=sys.stderr)
+            return 1
+        except UnalignedTimestampError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
     report = sync_ohlcv(
         universe_path=universe_path,
         config=config,

@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from tradingbot.data.io import InvalidCacheError, atomic_write_json, sha256_file
-from tradingbot.data.ohlcv.quality import sanitize_candles
+from tradingbot.data.ohlcv.quality import require_aligned_4h, sanitize_candles
 from tradingbot.data.ohlcv.store import load_candles, processed_path
 from tradingbot.data.ohlcv.timeframes import UnsupportedTimeframeError, timeframe_ms
 
@@ -66,6 +66,8 @@ def build_ohlcv_manifest(
             path = processed_path(processed_root, symbol, timeframe)
             try:
                 candles = load_candles(path)
+                if timeframe == "4h":
+                    require_aligned_4h(symbol, candles)
                 cleaned, _issues = sanitize_candles(
                     candles,
                     timeframe,

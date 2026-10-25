@@ -8,7 +8,9 @@ from tradingbot.data.ohlcv.manifest import (
     MANIFEST_SCHEMA,
     build_ohlcv_manifest,
     write_ohlcv_manifest,
+    write_ohlcv_manifests,
 )
+from tradingbot.data.ohlcv.quality import UnalignedTimestampError
 from tradingbot.data.ohlcv.models import Candle
 from tradingbot.data.ohlcv.store import dump_candles
 from tradingbot.data.ohlcv.sync import OHLCVConfig, sync_ohlcv
@@ -389,3 +391,29 @@ def test_manifest_write_failure_is_not_silent(tmp_path: Path, monkeypatch: pytes
             sleep_fn=lambda _d: None,
         )
     assert (tmp_path / "processed" / "sync_report.json").is_file()
+
+
+def test_unaligned_4h_does_not_write_manifest(tmp_path: Path) -> None:
+    universe = _universe(tmp_path, ["BTC/USDT"])
+    dump_candles(
+        tmp_path / "processed" / "BTCUSDT" / "4h.json",
+        [Candle(timestamp=1_800_000, open=1, high=2, low=0.5, close=1.5, volume=10)],
+        symbol="BTC/USDT",
+        timeframe="4h",
+    )
+    manifest_path = tmp_path / "processed" / "manifest_4h.json"
+    with pytest.raises(UnalignedTimestampError) as exc_info:
+        write_ohlcv_manifests(
+            universe_path=universe,
+            processed_root=tmp_path / "processed",
+            timeframes=("4h",),
+            provider="binance_public",
+            candle_limit=10,
+            drop_incomplete=True,
+            now_ms=4 * FOUR_H,
+            root=tmp_path,
+        )
+    assert exc_info.value.symbol == "BTC/USDT"
+    assert exc_info.value.timeframe == "4h"
+    assert exc_info.value.timestamp == 1_800_000
+    assert not manifest_path.exists()

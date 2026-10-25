@@ -32,6 +32,22 @@ def test_merge_keeps_existing_on_overlap() -> None:
     assert any(item["reason"] == "duplicate_timestamp" for item in issues)
 
 
+def test_merge_4h_keeps_existing_ohlc_when_incoming_differs() -> None:
+    four_h = 14_400_000
+    existing = Candle(timestamp=0, open=1, high=2, low=0.5, close=1.5, volume=10)
+    incoming = Candle(timestamp=0, open=10, high=20, low=5, close=15, volume=99)
+    added = Candle(timestamp=four_h, open=3, high=4, low=2, close=3.5, volume=8)
+    merged, issues = merge_candles(
+        [existing],
+        [incoming, added],
+        "4h",
+        now_ms=3 * four_h,
+        drop_incomplete=True,
+    )
+    assert merged == [existing, added]
+    assert {"reason": "duplicate_timestamp", "timestamp": 0} in issues
+
+
 def test_next_since_is_last_closed_plus_tf() -> None:
     assert next_since(3 * HOUR, "1h") == 4 * HOUR
 
