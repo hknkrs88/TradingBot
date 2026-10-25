@@ -1,5 +1,6 @@
 import importlib.util
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import ccxt
@@ -9,7 +10,7 @@ from tradingbot.data.io import atomic_write_json, sha256_file
 from tradingbot.data.ohlcv.models import Candle
 from tradingbot.data.ohlcv.quality import UnalignedTimestampError
 from tradingbot.data.ohlcv.store import dump_candles, load_candles
-from tradingbot.data.ohlcv.sync import OHLCVConfig, sync_ohlcv
+from tradingbot.data.ohlcv.sync import OHLCVConfig, sync_ohlcv, sync_symbol_timeframe
 
 HOUR = 3_600_000
 NOW = 4 * HOUR + 100
@@ -622,4 +623,142 @@ def test_sync_report_write_failure_keeps_alignment_error(
     assert path.read_bytes() == before
     assert not (tmp_path / "processed" / "sync_report.json").exists()
     assert not (tmp_path / "processed" / "manifest_4h.json").exists()
+
+
+def _ohlcv(candle: Candle) -> tuple[int, float, float, float, float, float]:
+    return (candle.timestamp, candle.open, candle.high, candle.low, candle.close, candle.volume)
+
+
+def test_4h_cache_hit_skips_provider_and_keeps_ohlcv(tmp_path: Path) -> None:
+    existing = [
+        Candle(timestamp=0, open=1, high=2, low=0.5, close=1.5, volume=10),
+        Candle(timestamp=FOUR_H, open=3, high=4, low=2, close=3.5, volume=8),
+    ]
+    processed = tmp_path / "processed"
+    path = processed / "BTCUSDT" / "4h.json"
+    dump_candles(path, existing, symbol="BTC/USDT", timeframe="4h")
+    provider = FakeProvider({})
+    result = sync_symbol_timeframe(
+        symbol="BTC/USDT",
+        timeframe="4h",
+        provider=provider,
+        config=_config(tmp_path, timeframes=("4h",)),
+        raw_root=tmp_path / "raw",
+        processed_root=processed,
+        now_ms=2 * FOUR_H + 1,
+        sleep_fn=lambda _delay: None,
+    )
+    saved = load_candles(path)
+    assert provider.calls == []
+    assert result["reason"] == "cache_hit"
+    assert result["candles_fetched"] == 0
+    assert saved[0].timestamp == existing[0].timestamp
+    assert saved[-1].timestamp == existing[-1].timestamp
+    assert _ohlcv(saved[0]) == _ohlcv(existing[0])
+    assert _ohlcv(saved[-1]) == _ohlcv(existing[-1])
+    assert saved == existing
+
+
+def test_4h_one_new_closed_candle_keeps_existing_and_drops_open(tmp_path: Path) -> None:
+    existing = Candle(timestamp=0, open=1, high=2, low=0.5, close=1.5, volume=10)
+    duplicate = Candle(timestamp=0, open=10, high=20, low=5, close=15, volume=99)
+    added = Candle(timestamp=FOUR_H, open=3, high=4, low=2, close=3.5, volume=8)
+    still_open = Candle(timestamp=2 * FOUR_H, open=4, high=5, low=3, close=4.5, volume=12)
+    processed = tmp_path / "processed"
+    path = processed / "BTCUSDT" / "4h.json"
+    dump_candles(path, [existing], symbol="BTC/USDT", timeframe="4h")
+    provider = FakeProvider({("BTC/USDT", "4h"): [duplicate, added, still_open]})
+    result = sync_symbol_timeframe(
+        symbol="BTC/USDT",
+        timeframe="4h",
+        provider=provider,
+        config=_config(tmp_path, timeframes=("4h",)),
+        raw_root=tmp_path / "raw",
+        processed_root=processed,
+        now_ms=2 * FOUR_H,
+        sleep_fn=lambda _delay: None,
+    )
+    saved = load_candles(path)
+    stamps = [candle.timestamp for candle in saved]
+    assert provider.calls[0]["since"] == 14_400_000
+    assert result["since"] == 14_400_000
+    assert _ohlcv(saved[0]) == _ohlcv(existing)
+    assert saved == [existing, added]
+    assert still_open.timestamp not in stamps
+    assert len(stamps) == len(set(stamps))
+    assert all(timestamp % 14_400_000 == 0 for timestamp in stamps)
+
+
+def test_4h_repeated_page_timestamp_stops_and_keeps_existing(tmp_path: Path) -> None:
+    existing = Candle(timestamp=0, open=1, high=2, low=0.5, close=1.5, volume=10)
+    stuck = Candle(timestamp=0, open=9, high=9, low=9, close=9, volume=9)
+    processed = tmp_path / "processed"
+    path = processed / "BTCUSDT" / "4h.json"
+    dump_candles(path, [existing], symbol="BTC/USDT", timeframe="4h")
+    provider = FakeProvider({("BTC/USDT", "4h"): [stuck, stuck, stuck]})
+    result = sync_symbol_timeframe(
+        symbol="BTC/USDT",
+        timeframe="4h",
+        provider=provider,
+        config=replace(_config(tmp_path, timeframes=("4h",)), candle_limit=3),
+        raw_root=tmp_path / "raw",
+        processed_root=processed,
+        now_ms=4 * FOUR_H,
+        sleep_fn=lambda _delay: None,
+    )
+    assert len(provider.calls) == 2
+    assert result["reason"] == "fetched"
+    assert load_candles(path) == [existing]
+
+
+def test_4h_symbol_failure_preserves_its_cache_and_updates_other(tmp_path: Path) -> None:
+    existing_eth = Candle(timestamp=0, open=1, high=2, low=0.5, close=1.5, volume=10)
+    existing_btc = Candle(timestamp=0, open=3, high=4, low=2, close=3.5, volume=8)
+    added = Candle(timestamp=FOUR_H, open=5, high=6, low=4, close=5.5, volume=12)
+    universe = tmp_path / "universe.json"
+    atomic_write_json(
+        universe,
+        {
+            "universe": [
+                {"binance_symbol": "ETH/USDT"},
+                {"binance_symbol": "BTC/USDT"},
+            ]
+        },
+    )
+    eth_path = tmp_path / "processed" / "ETHUSDT" / "4h.json"
+    btc_path = tmp_path / "processed" / "BTCUSDT" / "4h.json"
+    dump_candles(eth_path, [existing_eth], symbol="ETH/USDT", timeframe="4h")
+    dump_candles(btc_path, [existing_btc], symbol="BTC/USDT", timeframe="4h")
+    eth_before = eth_path.read_bytes()
+    provider = FakeProvider(
+        {
+            ("ETH/USDT", "4h"): ccxt.NetworkError("nope"),
+            ("BTC/USDT", "4h"): [added],
+        }
+    )
+    report = sync_ohlcv(
+        universe_path=universe,
+        config=_config(tmp_path, timeframes=("4h",)),
+        provider=provider,
+        root=tmp_path,
+        now_ms=2 * FOUR_H,
+        sleep_fn=lambda _delay: None,
+    )
+    saved = json.loads((tmp_path / "processed" / "sync_report.json").read_text(encoding="utf-8"))
+    assert eth_path.read_bytes() == eth_before
+    assert load_candles(btc_path) == [existing_btc, added]
+    assert report["symbols_ok"] == 1
+    assert report["symbols_failed"] == 1
+    assert saved["errors"] == [
+        {
+            "symbol": "ETH/USDT",
+            "timeframe": "4h",
+            "reason": "NetworkError",
+            "message": "nope",
+        }
+    ]
+    assert saved["series"][0]["symbol"] == "ETH/USDT"
+    assert saved["series"][0]["reason"] == "failed"
+    assert saved["series"][1]["symbol"] == "BTC/USDT"
+    assert saved["series"][1]["reason"] == "fetched"
 
