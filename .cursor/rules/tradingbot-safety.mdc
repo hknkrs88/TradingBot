@@ -1,0 +1,15 @@
+---
+description: TradingBot için inceleme, yetki, veri koruma ve kanıt sınırları
+alwaysApply: true
+---
+
+# TradingBot proje sınırları
+
+- Önce mevcut kodu, testleri ve Git durumunu incele. Kullanıcı açıkça istemeden dosya değiştirme.
+- Commit ve push yalnızca açık istek olursa yapılır.
+- Ağ çağrısı, veri senkronu ve gerçek emir yalnızca açık yetki olursa yapılır.
+- Finansal veriyi ve OHLCV manifestini koru. Doğrulama hatasında dosyayı silme, sıfırlama veya üzerine yazma.
+- Kod değişince ilgili testin komutunu, gerçek sonucunu ve `git diff --check` sonucunu raporla.
+- PASS yalnız okunan dosya veya komut çıktısıyla kanıtlanan duruma verilir.
+
+Örnek: 4h manifest hash'i uyuşmuyorsa `manifest_4h.json` yeniden yazılmaz; işlem hata ile durur.

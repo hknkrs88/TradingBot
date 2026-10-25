@@ -15,7 +15,9 @@ build/
 # IDE
 .vscode/
 .idea/
-.cursor/
+.cursor/*
+!.cursor/rules/
+!.cursor/rules/**
 
 # Logs
 logs/*
